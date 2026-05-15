@@ -48,6 +48,7 @@ type Source struct {
 
 type ParseOptions struct {
 	GeminiProjects map[string]string
+	Warnf          func(format string, args ...any)
 }
 
 func DefaultSources(home string) []Source {
@@ -70,6 +71,7 @@ func Discover(sources []Source, opts ParseOptions) ([]Record, error) {
 		}
 		err := filepath.WalkDir(src.Root, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
+				warnf(opts, "%s: %v", path, err)
 				return nil
 			}
 			if d.IsDir() {
@@ -80,6 +82,7 @@ func Discover(sources []Source, opts ParseOptions) ([]Record, error) {
 			}
 			rec, err := ParseFile(src.Tool, src.Root, path, opts)
 			if err != nil {
+				warnf(opts, "%s: %v", path, err)
 				return nil
 			}
 			out = append(out, rec)
@@ -174,11 +177,12 @@ func parseJSONL(tool Tool, root, path string, r io.Reader, opts ParseOptions) (R
 			if i == len(lines)-1 {
 				break
 			}
+			warnf(opts, "%s:%d: malformed JSONL line: %v", path, i+1, err)
 			continue
 		}
 		rec.MessageCount++
 		applyCommon(tool, &rec, obj, root, path, opts)
-		if text := extractText(obj); text != "" {
+		if text := extractConversationText(obj); text != "" {
 			if isUserMessage(obj) && rec.FirstPrompt == "" {
 				rec.FirstPrompt = text
 			}
@@ -361,7 +365,11 @@ func decodeClaudeProjectCWD(root, path string) string {
 	if !strings.HasPrefix(slug, "-") {
 		return ""
 	}
-	return strings.ReplaceAll(slug, "-", string(filepath.Separator))
+	cwd := strings.ReplaceAll(slug, "-", string(filepath.Separator))
+	if st, err := os.Stat(cwd); err == nil && st.IsDir() {
+		return cwd
+	}
+	return ""
 }
 
 func sessionIDFromFilename(path string) string {
@@ -453,6 +461,30 @@ func isUserMessage(obj map[string]any) bool {
 	return false
 }
 
+func extractConversationText(obj map[string]any) string {
+	role := strings.ToLower(firstNonEmpty(str(obj, "role"), str(obj, "speaker"), str(obj, "author")))
+	typ := strings.ToLower(str(obj, "type"))
+	if p, ok := obj["payload"].(map[string]any); ok && role == "" {
+		role = strings.ToLower(firstNonEmpty(str(p, "role"), str(p, "speaker"), str(p, "author")))
+	}
+	if role != "user" && role != "human" && role != "assistant" && role != "ai" && typ != "message" {
+		return ""
+	}
+	for _, key := range []string{"content", "message", "text", "prompt", "response"} {
+		if text := extractText(obj[key]); text != "" {
+			return text
+		}
+	}
+	if p, ok := obj["payload"].(map[string]any); ok {
+		for _, key := range []string{"content", "message", "text", "prompt", "response"} {
+			if text := extractText(p[key]); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
 func extractText(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -509,4 +541,10 @@ func compactValue(v any) string {
 		return ""
 	}
 	return string(b)
+}
+
+func warnf(opts ParseOptions, format string, args ...any) {
+	if opts.Warnf != nil {
+		opts.Warnf(format, args...)
+	}
 }

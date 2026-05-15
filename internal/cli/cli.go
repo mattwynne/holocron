@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/mattwynne/holocron/internal/index"
 	"github.com/mattwynne/holocron/internal/session"
 )
@@ -159,7 +161,9 @@ func (a App) execResult(id string) error {
 	}
 	if _, err := os.Stat(rec.SourcePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			_ = a.store().Delete(rec.ID)
+			if deleteErr := a.store().Delete(rec.ID); deleteErr != nil {
+				return fmt.Errorf("source session file is missing: %s; additionally failed to remove stale index entry: %w", rec.SourcePath, deleteErr)
+			}
 			return fmt.Errorf("source session file is missing: %s", rec.SourcePath)
 		}
 		return err
@@ -233,15 +237,44 @@ func (a App) daemon() error {
 	if err := a.fullScan(); err != nil {
 		fmt.Fprintln(a.Stderr, "holocron daemon:", err)
 	}
+	watcher, err := newSourceWatcher(session.DefaultSources(a.Home))
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	var debounce <-chan time.Time
+	var debounceTimer *time.Timer
+	schedule := func() {
+		if debounceTimer != nil {
+			debounceTimer.Stop()
+		}
+		debounceTimer = time.NewTimer(time.Second)
+		debounce = debounceTimer.C
+	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	for {
 		select {
+		case err := <-watcher.Errors:
+			fmt.Fprintln(a.Stderr, "holocron daemon watcher:", err)
+		case <-watcher.Events:
+			schedule()
+		case <-debounce:
+			debounce = nil
+			if err := a.fullScan(); err != nil {
+				fmt.Fprintln(a.Stderr, "holocron daemon:", err)
+			}
+			if err := watcher.Refresh(); err != nil {
+				fmt.Fprintln(a.Stderr, "holocron daemon watcher:", err)
+			}
 		case <-ticker.C:
 			if err := a.fullScan(); err != nil {
 				fmt.Fprintln(a.Stderr, "holocron daemon:", err)
+			}
+			if err := watcher.Refresh(); err != nil {
+				fmt.Fprintln(a.Stderr, "holocron daemon watcher:", err)
 			}
 		case <-stop:
 			return nil
@@ -250,7 +283,12 @@ func (a App) daemon() error {
 }
 
 func (a App) fullScan() error {
-	opts := session.ParseOptions{GeminiProjects: session.LoadGeminiProjects(a.Home)}
+	opts := session.ParseOptions{
+		GeminiProjects: session.LoadGeminiProjects(a.Home),
+		Warnf: func(format string, args ...any) {
+			fmt.Fprintf(a.Stderr, "holocron parser: "+format+"\n", args...)
+		},
+	}
 	records, err := session.Discover(session.DefaultSources(a.Home), opts)
 	if err != nil {
 		return err
@@ -262,20 +300,41 @@ func acquireLock(path string) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	if b, err := os.ReadFile(path); err == nil {
+	data := fmt.Sprintf("%d %s\n", os.Getpid(), time.Now().Format(time.RFC3339))
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			if _, err := f.WriteString(data); err != nil {
+				_ = f.Close()
+				_ = os.Remove(path)
+				return nil, err
+			}
+			if err := f.Close(); err != nil {
+				_ = os.Remove(path)
+				return nil, err
+			}
+			return func() { _ = os.Remove(path) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
 		fields := strings.Fields(string(b))
 		if len(fields) > 0 {
 			if pid, err := strconv.Atoi(fields[0]); err == nil && processRunning(pid) {
 				return nil, fmt.Errorf("daemon already running with pid %d", pid)
 			}
 		}
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 	}
-	data := fmt.Sprintf("%d %s\n", os.Getpid(), time.Now().Format(time.RFC3339))
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		return nil, err
-	}
-	return func() { _ = os.Remove(path) }, nil
 }
 
 func processRunning(pid int) bool {
@@ -287,6 +346,148 @@ func processRunning(pid int) bool {
 		return false
 	}
 	return p.Signal(syscall.Signal(0)) == nil
+}
+
+type sourceWatcher struct {
+	watcher *fsnotify.Watcher
+	sources []session.Source
+	mu      sync.Mutex
+	fds     map[string]struct{}
+	Events  chan struct{}
+	Errors  chan error
+	done    chan struct{}
+}
+
+func newSourceWatcher(sources []session.Source) (*sourceWatcher, error) {
+	fw, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+	w := &sourceWatcher{
+		watcher: fw,
+		sources: sources,
+		fds:     map[string]struct{}{},
+		Events:  make(chan struct{}, 1),
+		Errors:  make(chan error, 1),
+		done:    make(chan struct{}),
+	}
+	for _, src := range sources {
+		if err := w.addTree(src.Root); err != nil {
+			_ = w.Close()
+			return nil, err
+		}
+	}
+	go w.loop()
+	return w, nil
+}
+
+func (w *sourceWatcher) Refresh() error {
+	w.mu.Lock()
+	watched := make([]string, 0, len(w.fds))
+	for path := range w.fds {
+		watched = append(watched, path)
+	}
+	w.mu.Unlock()
+	for _, path := range watched {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			w.remove(path)
+		}
+	}
+	for _, src := range w.sources {
+		if err := w.addTree(src.Root); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *sourceWatcher) addTree(root string) error {
+	if _, err := os.Stat(root); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return w.addDir(path)
+		}
+		return nil
+	})
+}
+
+func (w *sourceWatcher) addDir(path string) error {
+	w.mu.Lock()
+	if _, ok := w.fds[path]; ok {
+		w.mu.Unlock()
+		return nil
+	}
+	w.mu.Unlock()
+	if err := w.watcher.Add(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	w.mu.Lock()
+	w.fds[path] = struct{}{}
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *sourceWatcher) remove(path string) {
+	w.mu.Lock()
+	_, ok := w.fds[path]
+	if ok {
+		delete(w.fds, path)
+	}
+	w.mu.Unlock()
+	if ok {
+		_ = w.watcher.Remove(path)
+	}
+}
+
+func (w *sourceWatcher) loop() {
+	for {
+		select {
+		case <-w.done:
+			return
+		case event, ok := <-w.watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Has(fsnotify.Create) {
+				if st, err := os.Stat(event.Name); err == nil && st.IsDir() {
+					if err := w.addTree(event.Name); err != nil {
+						select {
+						case w.Errors <- err:
+						default:
+						}
+					}
+				}
+			}
+			select {
+			case w.Events <- struct{}{}:
+			default:
+			}
+		case err, ok := <-w.watcher.Errors:
+			if !ok {
+				return
+			}
+			select {
+			case w.Errors <- err:
+			default:
+			}
+		}
+	}
+}
+
+func (w *sourceWatcher) Close() error {
+	close(w.done)
+	return w.watcher.Close()
 }
 
 func (a App) requireService() error {
@@ -329,6 +530,9 @@ func (a App) serviceInstall() error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
 	}
 	if err := os.WriteFile(plistPath(a.Home), []byte(plist(a.Home, exe)), 0o644); err != nil {
 		return err

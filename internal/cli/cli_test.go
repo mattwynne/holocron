@@ -3,10 +3,14 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/mattwynne/holocron/internal/session"
 )
 
 func TestSearchJSONCommand(t *testing.T) {
@@ -102,10 +106,75 @@ func TestOpenValidatesCWDAndExecsArgv(t *testing.T) {
 	}
 }
 
+func TestAcquireLockRefusesActiveLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.lock")
+	writeFile(t, path, fmt.Sprintf("%d 2026-05-13T10:00:00Z\n", os.Getpid()))
+
+	release, err := acquireLock(path)
+	if err == nil {
+		release()
+		t.Fatal("expected active lock error")
+	}
+	if !strings.Contains(err.Error(), "daemon already running") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAcquireLockReplacesStaleLockAtomically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.lock")
+	writeFile(t, path, "99999999 2026-05-13T10:00:00Z\n")
+
+	release, err := acquireLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(b), fmt.Sprintf("%d ", os.Getpid())) {
+		t.Fatalf("lock content = %q", string(b))
+	}
+}
+
+func TestSourceWatcherNoticesNewSubdirectory(t *testing.T) {
+	root := t.TempDir()
+	w, err := newSourceWatcher([]session.Source{{Tool: session.ToolCodex, Root: root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	subdir := filepath.Join(root, "nested")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	waitWatcherEvent(t, w.Events)
+	if err := w.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	w.mu.Lock()
+	_, watched := w.fds[subdir]
+	w.mu.Unlock()
+	if !watched {
+		t.Fatalf("new subdirectory was not watched")
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func waitWatcherEvent(t *testing.T, events <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-events:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for watcher event")
 	}
 }
 

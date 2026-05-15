@@ -1,18 +1,18 @@
 package index
 
 import (
-	"bytes"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mattwynne/holocron/internal/session"
+	_ "modernc.org/sqlite"
 )
 
 const SchemaVersion = 1
@@ -35,19 +35,25 @@ type SearchResult struct {
 }
 
 type storedRow struct {
-	ID            string `json:"id"`
-	Tool          string `json:"tool"`
-	SourcePath    string `json:"source_path"`
-	SessionID     string `json:"session_id"`
-	Title         string `json:"title"`
-	FirstPrompt   string `json:"first_prompt"`
-	CWD           string `json:"cwd"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
-	FileSizeBytes int64  `json:"file_size_bytes"`
-	MessageCount  int    `json:"message_count"`
-	ResumeArgv    string `json:"resume_argv"`
-	ResumeCommand string `json:"resume_command"`
+	ID            string
+	Tool          string
+	SourcePath    string
+	SessionID     string
+	Title         string
+	FirstPrompt   string
+	CWD           string
+	CreatedAt     string
+	UpdatedAt     string
+	FileSizeBytes int64
+	MessageCount  int
+	ResumeArgv    string
+	ResumeCommand string
+}
+
+type dbtx interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
 }
 
 func DefaultPath(home string) string {
@@ -55,78 +61,114 @@ func DefaultPath(home string) string {
 }
 
 func (s Store) Init() error {
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
+	db, err := s.openInitialized()
+	if err != nil {
 		return err
 	}
-	return s.exec(schemaSQL())
+	return db.Close()
 }
 
 func (s Store) Rebuild(records []session.Record) error {
-	if err := s.Init(); err != nil {
+	db, err := s.openInitialized()
+	if err != nil {
 		return err
 	}
-	existing, err := s.AssignedIDs()
+	defer db.Close()
+
+	existing, err := assignedIDs(db)
 	if err != nil {
 		return err
 	}
 	records = session.AssignStableIDs(records, existing)
-	var b strings.Builder
-	b.WriteString("BEGIN;\n")
-	b.WriteString("DELETE FROM sessions;\nDELETE FROM sessions_fts;\n")
-	for _, rec := range records {
-		b.WriteString(assignSQL(rec))
-		b.WriteString(sessionSQL(rec))
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
 	}
-	b.WriteString("COMMIT;\n")
-	return s.exec(b.String())
+	defer rollbackUnlessCommitted(tx, &err)
+
+	if _, err = tx.Exec("DELETE FROM sessions_fts"); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM sessions"); err != nil {
+		return err
+	}
+	for _, rec := range records {
+		if err = insertAssignedID(tx, rec); err != nil {
+			return err
+		}
+		if err = upsertSession(tx, rec); err != nil {
+			return err
+		}
+	}
+	err = tx.Commit()
+	return err
+}
+
+func (s Store) Upsert(records []session.Record) error {
+	db, err := s.openInitialized()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	existing, err := assignedIDs(db)
+	if err != nil {
+		return err
+	}
+	records = session.AssignStableIDs(records, existing)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer rollbackUnlessCommitted(tx, &err)
+
+	for _, rec := range records {
+		if err = insertAssignedID(tx, rec); err != nil {
+			return err
+		}
+		if err = upsertSession(tx, rec); err != nil {
+			return err
+		}
+	}
+	err = tx.Commit()
+	return err
 }
 
 func (s Store) AssignedIDs() (map[string]string, error) {
-	if err := s.Init(); err != nil {
-		return nil, err
-	}
-	out, err := s.queryJSON("SELECT tool, session_id, source_path, id FROM assigned_ids;")
+	db, err := s.openInitialized()
 	if err != nil {
 		return nil, err
 	}
-	var rows []struct {
-		Tool       string `json:"tool"`
-		SessionID  string `json:"session_id"`
-		SourcePath string `json:"source_path"`
-		ID         string `json:"id"`
-	}
-	if len(bytes.TrimSpace(out)) != 0 {
-		if err := json.Unmarshal(out, &rows); err != nil {
-			return nil, err
-		}
-	}
-	ids := map[string]string{}
-	for _, row := range rows {
-		ids[row.Tool+"\x00"+row.SessionID+"\x00"+row.SourcePath] = row.ID
-	}
-	return ids, nil
+	defer db.Close()
+	return assignedIDs(db)
 }
 
 func (s Store) Search(query string, limit int) ([]SearchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return s.Recent(limit)
 	}
-	sql := fmt.Sprintf(`SELECT s.id, s.tool, s.title, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command
+	return s.searchRows(`SELECT s.id, s.tool, s.title, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command
 FROM sessions_fts f JOIN sessions s ON s.id = f.id
-WHERE sessions_fts MATCH %s
+WHERE sessions_fts MATCH ?
 ORDER BY bm25(sessions_fts, 10.0, 10.0, 3.0, 1.0)
-LIMIT %d;`, sqlQuote(ftsQuery(query)), limit)
-	return s.searchRows(sql)
+LIMIT ?`, ftsQuery(query), limit)
 }
 
 func (s Store) Recent(limit int) ([]SearchResult, error) {
-	sql := fmt.Sprintf(`SELECT id, tool, title, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command
-FROM sessions ORDER BY updated_at DESC LIMIT %d;`, limit)
-	return s.searchRows(sql)
+	return s.searchRows(`SELECT id, tool, title, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command
+FROM sessions ORDER BY updated_at DESC LIMIT ?`, limit)
 }
 
 func (s Store) Get(id string) (session.Record, error) {
-	rows, err := s.rows("SELECT id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command FROM sessions WHERE id = " + sqlQuote(id) + ";")
+	db, err := s.openInitialized()
+	if err != nil {
+		return session.Record{}, err
+	}
+	defer db.Close()
+
+	rows, err := queryStoredRows(db, `SELECT id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command FROM sessions WHERE id = ?`, id)
 	if err != nil {
 		return session.Record{}, err
 	}
@@ -134,8 +176,10 @@ func (s Store) Get(id string) (session.Record, error) {
 		return session.Record{}, os.ErrNotExist
 	}
 	row := rows[0]
-	var argv []string
-	_ = json.Unmarshal([]byte(row.ResumeArgv), &argv)
+	argv, err := decodeArgv(row.ResumeArgv, row.ID)
+	if err != nil {
+		return session.Record{}, err
+	}
 	return session.Record{
 		ID:            row.ID,
 		Tool:          session.Tool(row.Tool),
@@ -154,18 +198,54 @@ func (s Store) Get(id string) (session.Record, error) {
 }
 
 func (s Store) Delete(id string) error {
-	return s.exec("BEGIN;\nDELETE FROM sessions WHERE id = " + sqlQuote(id) + ";\nDELETE FROM sessions_fts WHERE id = " + sqlQuote(id) + ";\nCOMMIT;\n")
+	db, err := s.openInitialized()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return deleteID(db, id)
 }
 
-func (s Store) searchRows(sql string) ([]SearchResult, error) {
-	rows, err := s.rows(sql)
+func (s Store) DeleteSource(path string) error {
+	db, err := s.openInitialized()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	rows, err := queryStoredRows(db, `SELECT id FROM sessions WHERE source_path = ?`, path)
+	if err != nil {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer rollbackUnlessCommitted(tx, &err)
+	for _, row := range rows {
+		if err = deleteID(tx, row.ID); err != nil {
+			return err
+		}
+	}
+	err = tx.Commit()
+	return err
+}
+
+func (s Store) searchRows(query string, args ...any) ([]SearchResult, error) {
+	db, err := s.openInitialized()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := queryStoredRows(db, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]SearchResult, 0, len(rows))
 	for _, row := range rows {
-		var argv []string
-		_ = json.Unmarshal([]byte(row.ResumeArgv), &argv)
+		argv, err := decodeArgv(row.ResumeArgv, row.ID)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, SearchResult{
 			ID:            row.ID,
 			Tool:          row.Tool,
@@ -182,48 +262,39 @@ func (s Store) searchRows(sql string) ([]SearchResult, error) {
 	return out, nil
 }
 
-func (s Store) rows(sql string) ([]storedRow, error) {
-	out, err := s.queryJSON(sql)
+func (s Store) openInitialized() (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", s.Path)
 	if err != nil {
 		return nil, err
 	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, nil
-	}
-	var rows []storedRow
-	if err := json.Unmarshal(out, &rows); err != nil {
+	db.SetMaxOpenConns(1)
+	if err := initSchema(db); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
-	return rows, nil
+	return db, nil
 }
 
-func (s Store) exec(sql string) error {
-	cmd := exec.Command("sqlite3", s.Path)
-	cmd.Stdin = strings.NewReader(sql)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("sqlite3: %w: %s", err, strings.TrimSpace(stderr.String()))
+func initSchema(db *sql.DB) error {
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return fmt.Errorf("enable WAL: %w", err)
 	}
-	return nil
-}
-
-func (s Store) queryJSON(sql string) ([]byte, error) {
-	cmd := exec.Command("sqlite3", "-json", s.Path, sql)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("sqlite3: %w: %s", err, strings.TrimSpace(stderr.String()))
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		return fmt.Errorf("set busy timeout: %w", err)
 	}
-	return out, nil
-}
-
-func schemaSQL() string {
-	return fmt.Sprintf(`
-PRAGMA journal_mode=WAL;
-PRAGMA busy_timeout=5000;
-PRAGMA user_version=%d;
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if version != 0 && version != SchemaVersion {
+		if _, err := db.Exec(`DROP TABLE IF EXISTS sessions_fts; DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS assigned_ids;`); err != nil {
+			return fmt.Errorf("rebuild incompatible schema version %d: %w", version, err)
+		}
+	}
+	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS assigned_ids (
   tool TEXT NOT NULL,
   session_id TEXT NOT NULL,
@@ -247,30 +318,130 @@ CREATE TABLE IF NOT EXISTS sessions (
   resume_command TEXT NOT NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(id UNINDEXED, title, first_prompt, cwd, transcript_text);
-`, SchemaVersion)
+`); err != nil {
+		return fmt.Errorf("initialize sqlite schema, including FTS5 table: %w", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", SchemaVersion)); err != nil {
+		return fmt.Errorf("store schema version: %w", err)
+	}
+	return nil
 }
 
-func assignSQL(rec session.Record) string {
-	return fmt.Sprintf("INSERT OR IGNORE INTO assigned_ids(tool, session_id, source_path, id) VALUES(%s,%s,%s,%s);\n",
-		sqlQuote(string(rec.Tool)), sqlQuote(rec.SessionID), sqlQuote(rec.SourcePath), sqlQuote(rec.ID))
+func assignedIDs(db dbtx) (map[string]string, error) {
+	rows, err := queryStoredRows(db, "SELECT tool, session_id, source_path, id FROM assigned_ids")
+	if err != nil {
+		return nil, err
+	}
+	ids := map[string]string{}
+	for _, row := range rows {
+		ids[row.Tool+"\x00"+row.SessionID+"\x00"+row.SourcePath] = row.ID
+	}
+	return ids, nil
 }
 
-func sessionSQL(rec session.Record) string {
-	argv, _ := json.Marshal(rec.ResumeArgv)
+func insertAssignedID(db dbtx, rec session.Record) error {
+	_, err := db.Exec(`INSERT OR IGNORE INTO assigned_ids(tool, session_id, source_path, id) VALUES(?, ?, ?, ?)`, string(rec.Tool), rec.SessionID, rec.SourcePath, rec.ID)
+	return err
+}
+
+func upsertSession(db dbtx, rec session.Record) error {
+	argv, err := json.Marshal(rec.ResumeArgv)
+	if err != nil {
+		return err
+	}
 	created := rec.CreatedAt.UTC().Format(time.RFC3339)
 	updated := rec.UpdatedAt.UTC().Format(time.RFC3339)
-	return fmt.Sprintf(`INSERT OR REPLACE INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command)
-VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%s,%s);
-INSERT INTO sessions_fts(id, title, first_prompt, cwd, transcript_text) VALUES(%s,%s,%s,%s,%s);
-`,
-		sqlQuote(rec.ID), sqlQuote(string(rec.Tool)), sqlQuote(rec.SourcePath), sqlQuote(rec.SessionID),
-		sqlQuote(rec.Title), sqlQuote(rec.FirstPrompt), sqlQuote(rec.CWD), sqlQuote(created), sqlQuote(updated),
-		rec.FileSizeBytes, rec.MessageCount, sqlQuote(string(argv)), sqlQuote(rec.ResumeCommand),
-		sqlQuote(rec.ID), sqlQuote(rec.Title), sqlQuote(rec.FirstPrompt), sqlQuote(rec.CWD), sqlQuote(rec.Transcript))
+	if _, err := db.Exec(`INSERT OR REPLACE INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.ID, string(rec.Tool), rec.SourcePath, rec.SessionID, rec.Title, rec.FirstPrompt, rec.CWD, created, updated, rec.FileSizeBytes, rec.MessageCount, string(argv), rec.ResumeCommand); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`DELETE FROM sessions_fts WHERE id = ?`, rec.ID); err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO sessions_fts(id, title, first_prompt, cwd, transcript_text) VALUES(?, ?, ?, ?, ?)`, rec.ID, rec.Title, rec.FirstPrompt, rec.CWD, rec.Transcript)
+	return err
 }
 
-func sqlQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+func deleteID(db dbtx, id string) error {
+	if _, err := db.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
+		return err
+	}
+	_, err := db.Exec(`DELETE FROM sessions_fts WHERE id = ?`, id)
+	return err
+}
+
+func queryStoredRows(db dbtx, query string, args ...any) ([]storedRow, error) {
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []storedRow
+	for rows.Next() {
+		cols, err := rows.Columns()
+		if err != nil {
+			return nil, err
+		}
+		values := make([]sql.NullString, len(cols))
+		dest := make([]any, len(cols))
+		for i := range values {
+			dest[i] = &values[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, err
+		}
+		var row storedRow
+		for i, col := range cols {
+			val := ""
+			if values[i].Valid {
+				val = values[i].String
+			}
+			switch col {
+			case "id":
+				row.ID = val
+			case "tool":
+				row.Tool = val
+			case "source_path":
+				row.SourcePath = val
+			case "session_id":
+				row.SessionID = val
+			case "title":
+				row.Title = val
+			case "first_prompt":
+				row.FirstPrompt = val
+			case "cwd":
+				row.CWD = val
+			case "created_at":
+				row.CreatedAt = val
+			case "updated_at":
+				row.UpdatedAt = val
+			case "file_size_bytes":
+				row.FileSizeBytes, _ = strconv.ParseInt(val, 10, 64)
+			case "message_count":
+				row.MessageCount, _ = strconv.Atoi(val)
+			case "resume_argv":
+				row.ResumeArgv = val
+			case "resume_command":
+				row.ResumeCommand = val
+			}
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func rollbackUnlessCommitted(tx *sql.Tx, errp *error) {
+	if *errp != nil {
+		_ = tx.Rollback()
+	}
+}
+
+func decodeArgv(raw, id string) ([]string, error) {
+	var argv []string
+	if err := json.Unmarshal([]byte(raw), &argv); err != nil {
+		return nil, fmt.Errorf("invalid stored resume_argv for %s: %w", id, err)
+	}
+	return argv, nil
 }
 
 func ftsQuery(q string) string {
