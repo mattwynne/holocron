@@ -20,6 +20,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/mattwynne/holocron/internal/index"
 	"github.com/mattwynne/holocron/internal/session"
+	"github.com/mattwynne/holocron/internal/tui"
 )
 
 const serviceLabel = "net.mattwynne.holocron"
@@ -123,25 +124,14 @@ func (a App) pick(args []string) error {
 	if err := a.requireService(); err != nil {
 		return err
 	}
-	query := strings.Join(args, " ")
-	var (
-		results []index.SearchResult
-		err     error
-	)
-	if strings.TrimSpace(query) == "" {
-		results, err = a.store().Recent(100)
-	} else {
-		results, err = a.store().Search(query, 100)
-	}
+	result, err := tui.Pick(a.store(), strings.Join(args, " "), a.Stdout, a.Stderr)
 	if err != nil {
 		return err
 	}
-	if len(results) == 0 {
-		return errors.New("no sessions found")
+	if !result.OK {
+		return nil
 	}
-	// TODO: replace this non-interactive fallback with a Bubble Tea picker.
-	fmt.Fprintln(a.Stderr, "interactive pick TUI is not implemented yet; opening the top-ranked result")
-	return a.execResult(results[0].ID)
+	return a.execResult(result.ID)
 }
 
 func (a App) open(args []string) error {
