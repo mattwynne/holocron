@@ -159,14 +159,21 @@ func ParseFile(tool Tool, root, path string, opts ParseOptions) (Record, error) 
 func parseJSONL(tool Tool, root, path string, r io.Reader, opts ParseOptions) (Record, error) {
 	var rec Record
 	var texts []string
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	reader := bufio.NewReader(r)
 	var lines []string
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
-		return rec, err
+	for {
+		line, err := reader.ReadString('\n')
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+		if line != "" || err == nil {
+			lines = append(lines, line)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return rec, err
+		}
 	}
 	for i, line := range lines {
 		if strings.TrimSpace(line) == "" {

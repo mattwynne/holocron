@@ -242,7 +242,7 @@ func (a App) daemon() error {
 		return err
 	}
 	defer watcher.Close()
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 	var debounce <-chan time.Time
 	var debounceTimer *time.Timer
@@ -538,7 +538,13 @@ func (a App) serviceInstall() error {
 		return err
 	}
 	_ = launchctl("bootout", serviceTarget())
-	return launchctl("bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plistPath(a.Home))
+	if err := launchctl("bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plistPath(a.Home)); err != nil {
+		if statusErr := launchctl("print", serviceTarget()); statusErr == nil {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (a App) serviceUninstall() error {
