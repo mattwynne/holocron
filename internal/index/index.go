@@ -25,6 +25,7 @@ type SearchResult struct {
 	ID            string   `json:"id"`
 	Tool          string   `json:"tool"`
 	Title         string   `json:"title"`
+	Folder        string   `json:"folder"`
 	CWD           string   `json:"cwd"`
 	UpdatedAt     string   `json:"updated_at"`
 	Size          string   `json:"size"`
@@ -250,6 +251,7 @@ func (s Store) searchRows(query string, args ...any) ([]SearchResult, error) {
 			ID:            row.ID,
 			Tool:          row.Tool,
 			Title:         row.Title,
+			Folder:        FolderName(row.CWD),
 			CWD:           row.CWD,
 			UpdatedAt:     row.UpdatedAt,
 			Size:          HumanSize(row.FileSizeBytes),
@@ -455,6 +457,13 @@ func ftsQuery(q string) string {
 		quoted[i] = `"` + strings.ReplaceAll(f, `"`, `""`) + `"`
 	}
 	return strings.Join(quoted, " AND ")
+}
+
+func FolderName(cwd string) string {
+	if cwd == "" {
+		return ""
+	}
+	return filepath.Base(filepath.Clean(cwd))
 }
 
 func HumanSize(n int64) string {

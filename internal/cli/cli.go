@@ -65,6 +65,8 @@ func (a App) Run(args []string) int {
 		err = a.service(args[1:])
 	case "daemon":
 		err = a.daemon()
+	case "register-session":
+		err = a.registerSession(args[1:])
 	default:
 		a.Usage()
 		return 2
@@ -203,9 +205,9 @@ func parseSearchArgs(args []string) (string, bool, error) {
 
 func printTable(w io.Writer, results []index.SearchResult) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tTOOL\tUPDATED\tSIZE\tTITLE")
+	fmt.Fprintln(tw, "ID\tTOOL\tUPDATED\tSIZE\tFOLDER\tTITLE")
 	for _, r := range results {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, shortTime(r.UpdatedAt), r.Size, r.Title)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, shortTime(r.UpdatedAt), r.Size, r.Folder, r.Title)
 	}
 	_ = tw.Flush()
 }
@@ -219,6 +221,9 @@ func shortTime(value string) string {
 }
 
 func (a App) daemon() error {
+	if err := a.ensurePiExtension(); err != nil {
+		fmt.Fprintln(a.Stderr, "holocron daemon:", err)
+	}
 	lock, err := acquireLock(filepath.Join(a.Home, ".local", "share", "holocron", "daemon.lock"))
 	if err != nil {
 		return err
@@ -283,7 +288,116 @@ func (a App) fullScan() error {
 	if err != nil {
 		return err
 	}
+	registered, err := a.registeredSessionRecords(opts)
+	if err != nil {
+		return err
+	}
+	records = append(records, registered...)
 	return a.store().Rebuild(records)
+}
+
+func (a App) registerSession(args []string) error {
+	tool, path, err := parseRegisterSessionArgs(args)
+	if err != nil {
+		return err
+	}
+	if tool != session.ToolPi {
+		return fmt.Errorf("unsupported tool %q", tool)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	rec, err := session.ParseFile(tool, filepath.Dir(abs), abs, session.ParseOptions{})
+	if err != nil {
+		return err
+	}
+	if err := a.rememberRegisteredSession(abs); err != nil {
+		return err
+	}
+	return a.store().Upsert([]session.Record{rec})
+}
+
+func parseRegisterSessionArgs(args []string) (session.Tool, string, error) {
+	if len(args) == 2 {
+		return session.Tool(args[0]), args[1], nil
+	}
+	if len(args) == 4 && args[0] == "--tool" && args[2] == "--path" {
+		return session.Tool(args[1]), args[3], nil
+	}
+	return "", "", errors.New("register-session requires: holocron register-session pi PATH")
+}
+
+func (a App) registeredSessionRecords(opts session.ParseOptions) ([]session.Record, error) {
+	paths, err := a.registeredSessionPaths()
+	if err != nil {
+		return nil, err
+	}
+	var records []session.Record
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		rec, err := session.ParseFile(session.ToolPi, filepath.Dir(path), path, opts)
+		if err != nil {
+			if opts.Warnf != nil {
+				opts.Warnf("%s: %v", path, err)
+			}
+			continue
+		}
+		records = append(records, rec)
+	}
+	return records, nil
+}
+
+func (a App) registeredSessionPaths() ([]string, error) {
+	data, err := os.ReadFile(a.registeredSessionsPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		path := strings.TrimSpace(line)
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	return out, nil
+}
+
+func (a App) rememberRegisteredSession(path string) error {
+	paths, err := a.registeredSessionPaths()
+	if err != nil {
+		return err
+	}
+	for _, existing := range paths {
+		if existing == path {
+			return nil
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(a.registeredSessionsPath()), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(a.registeredSessionsPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintln(f, path)
+	return err
+}
+
+func (a App) registeredSessionsPath() string {
+	return filepath.Join(a.Home, ".local", "share", "holocron", "registered-pi-sessions.txt")
 }
 
 func acquireLock(path string) (func(), error) {
@@ -500,6 +614,9 @@ func (a App) service(args []string) error {
 	case "uninstall":
 		return a.serviceUninstall()
 	case "start":
+		if err := a.ensurePiExtension(); err != nil {
+			return err
+		}
 		return launchctl("bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plistPath(a.Home))
 	case "stop":
 		return launchctl("bootout", serviceTarget())
@@ -511,6 +628,9 @@ func (a App) service(args []string) error {
 }
 
 func (a App) serviceInstall() error {
+	if err := a.ensurePiExtension(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(plistPath(a.Home)), 0o755); err != nil {
 		return err
 	}
@@ -540,6 +660,69 @@ func (a App) serviceInstall() error {
 func (a App) serviceUninstall() error {
 	_ = launchctl("bootout", serviceTarget())
 	return os.Remove(plistPath(a.Home))
+}
+
+func (a App) ensurePiExtension() error {
+	piDir := filepath.Join(a.Home, ".pi")
+	if st, err := os.Stat(piDir); err != nil || !st.IsDir() {
+		return nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	extDir := filepath.Join(a.Home, ".pi", "agent", "extensions")
+	if err := os.MkdirAll(extDir, 0o755); err != nil {
+		return err
+	}
+	content := holocronPiExtension(exe)
+	return os.WriteFile(filepath.Join(extDir, "holocron.ts"), []byte(content), 0o644)
+}
+
+func holocronPiExtension(exe string) string {
+	exeJSON, _ := json.Marshal(exe)
+	return fmt.Sprintf(`import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+
+const HOLOCRON = %s;
+
+export default function (pi: ExtensionAPI) {
+  let sessionFile: string | undefined;
+
+  const register = () => {
+    if (!sessionFile || process.env.HOLOCRON_REGISTER_SESSION === "0") return false;
+    if (!existsSync(sessionFile)) return false;
+    spawnSync(HOLOCRON, ["register-session", "pi", sessionFile], {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+    return true;
+  };
+
+  const registerSoon = (attempt = 0) => {
+    setTimeout(() => {
+      if (!register() && attempt < 20) registerSoon(attempt + 1);
+    }, 250);
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    sessionFile = ctx.sessionManager.getSessionFile();
+    registerSoon();
+  });
+
+  pi.on("agent_end", async () => {
+    register();
+  });
+
+  pi.on("session_shutdown", async () => {
+    register();
+  });
+}
+`, string(exeJSON))
 }
 
 func (a App) serviceStatus() error {

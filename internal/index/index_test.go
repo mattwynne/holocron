@@ -47,6 +47,9 @@ func TestSearchAndDeletedSourceRemoval(t *testing.T) {
 	if results[0].Size != "42 KB" {
 		t.Fatalf("size = %q", results[0].Size)
 	}
+	if results[0].Folder != "project" {
+		t.Fatalf("folder = %q", results[0].Folder)
+	}
 
 	if err := store.Rebuild(nil); err != nil {
 		t.Fatal(err)

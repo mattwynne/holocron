@@ -41,10 +41,89 @@ func TestSearchJSONCommand(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
-	for _, want := range []string{`"id": "codex:abcdef12"`, `"tool": "codex"`, `"title": "Fix auth redirect handling"`, `"resume_argv"`} {
+	for _, want := range []string{`"id": "codex:abcdef12"`, `"tool": "codex"`, `"title": "Fix auth redirect handling"`, `"folder": "project"`, `"resume_argv"`} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("json missing %s: %s", want, out.String())
 		}
+	}
+}
+
+func TestSearchTableShowsFolder(t *testing.T) {
+	home := t.TempDir()
+	srcRoot := filepath.Join(home, ".codex", "sessions", "2026")
+	project := filepath.Join(home, "work", "project")
+	if err := os.MkdirAll(srcRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(srcRoot, "codex.jsonl")
+	writeFile(t, sessionFile, strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"abcdef1234567890","timestamp":"2026-05-13T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Fix auth redirect handling"}`,
+	}, "\n")+"\n")
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HOLOCRON_SKIP_SERVICE_CHECK", "1")
+	var out bytes.Buffer
+	app.Stdout = &out
+	code := app.Run([]string{"search", "auth"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	for _, want := range []string{"FOLDER", "project", "Fix auth redirect handling"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("table missing %q: %s", want, out.String())
+		}
+	}
+}
+
+func TestRegisterSessionIndexesProjectLocalPiSession(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionDir := filepath.Join(project, "data", "email-triage", "sessions")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(sessionDir, "thread.jsonl")
+	writeFile(t, sessionFile, strings.Join([]string{
+		`{"type":"session","id":"pi-local-session-123456","cwd":` + quote(project) + `,"timestamp":"2026-05-16T10:00:00Z"}`,
+		`{"type":"message","message":{"role":"user","content":[{"type":"text","text":"Draft KMC digital systems proposal for Mike"}]}}`,
+	}, "\n")+"\n")
+
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}
+	if code := app.Run([]string{"register-session", "pi", sessionFile}); code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+
+	t.Setenv("HOLOCRON_SKIP_SERVICE_CHECK", "1")
+	var out bytes.Buffer
+	app.Stdout = &out
+	if code := app.Run([]string{"search", "KMC Mike", "--json"}); code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	for _, want := range []string{`"tool": "pi"`, `"folder": "project"`, sessionFile} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("json missing %s: %s", want, out.String())
+		}
+	}
+
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := app.Run([]string{"search", "KMC Mike", "--json"}); code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	if !strings.Contains(out.String(), sessionFile) {
+		t.Fatalf("registered session was lost after full scan: %s", out.String())
 	}
 }
 

@@ -205,10 +205,41 @@ func (m Model) renderRow(i int) string {
 		style = style.Foreground(lipgloss.Color("15")).Background(lipgloss.Color("4"))
 	}
 	date := shortUpdated(r.UpdatedAt)
-	meta := fmt.Sprintf("%s  %s  %s  %d msgs", r.Tool, date, r.Size, r.MessageCount)
-	line1 := truncate(fmt.Sprintf("%s%s", prefix, r.Title), m.width)
-	line2 := truncate(fmt.Sprintf("  %s  %s", meta, r.CWD), m.width)
+	bar := sizeBar(r.FileSizeBytes, m.maxFileSize(), 10)
+	detail := r.CWD
+	if r.Folder != "" && r.Folder != r.CWD {
+		detail = fmt.Sprintf("%s  %s", r.Folder, r.CWD)
+	}
+	line1 := truncate(fmt.Sprintf("%s%s  %s", prefix, r.Title, r.ID), m.width)
+	line2 := truncate(fmt.Sprintf("  %-6s %s  %s  %s", r.Tool, date, bar, detail), m.width)
 	return style.Render(line1) + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(line2)
+}
+
+func (m Model) maxFileSize() int64 {
+	var max int64
+	for _, r := range m.results {
+		if r.FileSizeBytes > max {
+			max = r.FileSizeBytes
+		}
+	}
+	return max
+}
+
+func sizeBar(value, max int64, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	filled := 0
+	if value > 0 && max > 0 {
+		filled = int((value*int64(width) + max - 1) / max)
+		if filled < 1 {
+			filled = 1
+		}
+		if filled > width {
+			filled = width
+		}
+	}
+	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
 }
 
 func (m Model) runSearch(query string) tea.Cmd {

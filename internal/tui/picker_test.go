@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -85,5 +86,24 @@ func TestCtrlUClearsQuery(t *testing.T) {
 	got := updated.(Model)
 	if got.query != "" || !got.loading {
 		t.Fatalf("query=%q loading=%v", got.query, got.loading)
+	}
+}
+
+func TestRenderRowShowsFolderIDAndSizeBar(t *testing.T) {
+	m := NewModel(&fakeStore{}, "")
+	m.results = []index.SearchResult{
+		{ID: "pi:small", Tool: "pi", Title: "Fix auth", Folder: "project", CWD: "/tmp/project", FileSizeBytes: 25},
+		{ID: "pi:large", Tool: "pi", Title: "Big session", Folder: "other", CWD: "/tmp/other", FileSizeBytes: 100},
+	}
+	row := m.renderRow(0)
+	for _, want := range []string{"project", "pi:small", "███░░░░░░░"} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("row missing %q: %q", want, row)
+		}
+	}
+	for _, unwanted := range []string{"msgs", "25 B"} {
+		if strings.Contains(row, unwanted) {
+			t.Fatalf("row contains %q: %q", unwanted, row)
+		}
 	}
 }
