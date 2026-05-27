@@ -41,7 +41,7 @@ func TestSearchJSONCommand(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
-	for _, want := range []string{`"id": "codex:abcdef12"`, `"tool": "codex"`, `"title": "Fix auth redirect handling"`, `"folder": "project"`, `"resume_argv"`} {
+	for _, want := range []string{`"id": "cx:abcdef12"`, `"tool": "codex"`, `"title": "Fix auth redirect handling"`, `"folder": "project"`, `"resume_argv"`} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("json missing %s: %s", want, out.String())
 		}
@@ -200,7 +200,7 @@ func TestSummarizeDryRunUsesConfiguredModelCommand(t *testing.T) {
 	}
 	var out bytes.Buffer
 	app.Stdout = &out
-	if code := app.Run([]string{"summarize", "codex:sum12345", "--dry-run", "--json"}); code != 0 {
+	if code := app.Run([]string{"summarize", "cx:sum12345", "--dry-run", "--json"}); code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
 	if !strings.Contains(out.String(), `"title": "Summarize sessions"`) || !strings.Contains(out.String(), `"dry_run": true`) {
@@ -233,12 +233,12 @@ func TestSummarizeSkipsExistingGeneratedMetadataWithoutForce(t *testing.T) {
 	if err := app.fullScan(); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.store().UpdateGenerated("codex:skip1234", "Existing title", "Existing summary.", "test", time.Now()); err != nil {
+	if err := app.store().UpdateGenerated("cx:skip1234", "Existing title", "Existing summary.", "test", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
 	app.Stdout = &out
-	if code := app.Run([]string{"summarize", "codex:skip1234", "--json"}); code != 0 {
+	if code := app.Run([]string{"summarize", "cx:skip1234", "--json"}); code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
 	if strings.TrimSpace(out.String()) != "[]" {
@@ -283,7 +283,7 @@ func TestSummarizeTodayOnlyUsesLast24Hours(t *testing.T) {
 	if code := app.Run([]string{"summarize", "--today", "--dry-run", "--json"}); code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
-	if !strings.Contains(out.String(), `"id": "codex:today123"`) || strings.Contains(out.String(), "old123") {
+	if !strings.Contains(out.String(), `"id": "cx:today123"`) || strings.Contains(out.String(), "old123") {
 		t.Fatalf("unexpected output: %s", out.String())
 	}
 }
@@ -335,7 +335,7 @@ func TestOpenValidatesCWDAndExecsArgv(t *testing.T) {
 		}
 		return errExec
 	}
-	if err := app.open([]string{"codex:abcdef12"}); !errors.Is(err, errExec) {
+	if err := app.open([]string{"cx:abcdef12"}); !errors.Is(err, errExec) {
 		t.Fatalf("open err = %v", err)
 	}
 	if gotPath != fakeCodex {

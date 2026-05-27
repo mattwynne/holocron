@@ -46,7 +46,7 @@ The indexer must resolve and store the correct original working directory during
 
 ### Stable IDs
 
-IDs are normally `<tool>:<prefix>`, where `<prefix>` is the shortest unique prefix of `session_id`, with a minimum of 8 characters.
+IDs are normally `<tool-prefix>:<prefix>`, where `<prefix>` is the shortest unique prefix of `session_id`, with a minimum of 8 characters. Tool prefixes are two letters: `pi`, `cx` for Codex, `cd` for Claude, and `gm` for Gemini.
 
 Stability rule:
 
@@ -198,7 +198,7 @@ For MVP, date/project/tool lookup can work through indexed fields and normal que
 ```json
 [
   {
-    "id": "claude:0cd2fc8c",
+    "id": "cd:0cd2fc8c",
     "tool": "claude",
     "title": "Fix auth redirect handling",
     "cwd": "/Users/matt/git/example/project",

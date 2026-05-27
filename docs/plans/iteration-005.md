@@ -37,7 +37,7 @@ Terminology:
 ### View a session in Pi
 
 ```sh
-holocron view codex:abc123
+holocron view cx:abc123
 ```
 
 Behavior:
@@ -55,8 +55,8 @@ This is for reading and asking follow-up questions. If Pi mutates the export, th
 ### Continue a session in Pi
 
 ```sh
-holocron continue codex:abc123
-holocron continue claude:def456 --model sonnet
+holocron continue cx:abc123
+holocron continue cd:def456 --model sonnet
 ```
 
 Behavior:
@@ -77,7 +77,7 @@ The continuation session header should include metadata pointing back to the ori
 ### Native resume remains separate
 
 ```sh
-holocron open codex:abc123
+holocron open cx:abc123
 ```
 
 Still runs the native resume command, e.g. `codex resume ...`.

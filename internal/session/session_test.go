@@ -175,10 +175,10 @@ func TestAssignStableIDsLengthensOnlyNewCollisions(t *testing.T) {
 		{Tool: ToolCodex, SessionID: "abcdef129999", SourcePath: "/b"},
 	}
 	assigned := AssignStableIDs(records, nil)
-	if assigned[0].ID != "codex:abcdef12" {
+	if assigned[0].ID != "cx:abcdef12" {
 		t.Fatalf("first id = %q", assigned[0].ID)
 	}
-	if assigned[1].ID != "codex:abcdef129" {
+	if assigned[1].ID != "cx:abcdef129" {
 		t.Fatalf("second id = %q", assigned[1].ID)
 	}
 
@@ -189,10 +189,10 @@ func TestAssignStableIDsLengthensOnlyNewCollisions(t *testing.T) {
 		{Tool: ToolCodex, SessionID: "abcdef123456", SourcePath: "/a"},
 		{Tool: ToolCodex, SessionID: "abcdef120000", SourcePath: "/c"},
 	}, existing)
-	if reindexed[0].ID != "codex:abcdef12" {
+	if reindexed[0].ID != "cx:abcdef12" {
 		t.Fatalf("existing id changed to %q", reindexed[0].ID)
 	}
-	if reindexed[1].ID != "codex:abcdef120" {
+	if reindexed[1].ID != "cx:abcdef120" {
 		t.Fatalf("new collision id = %q", reindexed[1].ID)
 	}
 }

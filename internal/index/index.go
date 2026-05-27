@@ -15,7 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 type Store struct {
 	Path string
@@ -398,6 +398,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(id UNINDEXED, title, 
 			return err
 		}
 	}
+	if version < 4 {
+		if err := migrateLegacyIDPrefixes(db); err != nil {
+			return err
+		}
+	}
 	if err := markAlreadyNamedSessionsDone(db); err != nil {
 		return err
 	}
@@ -432,6 +437,23 @@ func addSummaryStatusColumns(db *sql.DB) error {
 	}
 	_, err := db.Exec(`UPDATE sessions SET summary_status = 'done' WHERE generated_title <> '' OR generated_summary <> ''`)
 	return err
+}
+
+func migrateLegacyIDPrefixes(db *sql.DB) error {
+	for oldPrefix, newPrefix := range map[string]string{
+		"claude": "cd",
+		"codex":  "cx",
+		"gemini": "gm",
+	} {
+		old := oldPrefix + ":"
+		new := newPrefix + ":"
+		for _, table := range []string{"assigned_ids", "sessions", "sessions_fts"} {
+			if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET id = ? || substr(id, ?) WHERE id LIKE ?`, table), new, len(old)+1, old+"%"); err != nil {
+				return fmt.Errorf("migrate %s IDs from %s to %s: %w", table, oldPrefix, newPrefix, err)
+			}
+		}
+	}
+	return nil
 }
 
 func assignedIDs(db dbtx) (map[string]string, error) {

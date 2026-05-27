@@ -1,6 +1,7 @@
 package index
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mattwynne/holocron/internal/session"
+	_ "modernc.org/sqlite"
 )
 
 func TestSearchAndDeletedSourceRemoval(t *testing.T) {
@@ -41,7 +43,7 @@ func TestSearchAndDeletedSourceRemoval(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("results = %d", len(results))
 	}
-	if results[0].ID != "codex:abcdef12" {
+	if results[0].ID != "cx:abcdef12" {
 		t.Fatalf("id = %q", results[0].ID)
 	}
 	if results[0].Size != "42 KB" {
@@ -65,7 +67,7 @@ func TestSearchAndDeletedSourceRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ids[session.StableKey(rec)] != "codex:abcdef12" {
+	if ids[session.StableKey(rec)] != "cx:abcdef12" {
 		t.Fatalf("assigned id was not retained: %#v", ids)
 	}
 }
@@ -170,7 +172,7 @@ func TestGeneratedTitleIsUsedWhenProviderTitleIsFallback(t *testing.T) {
 	if err := store.Rebuild([]session.Record{rec}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateGenerated("codex:generate", "Generated useful title", "Summary", "test", time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)); err != nil {
+	if err := store.UpdateGenerated("cx:generate", "Generated useful title", "Summary", "test", time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
 	results, err := store.Recent(10)
@@ -293,6 +295,48 @@ func TestRebuildPreservesGeneratedMetadata(t *testing.T) {
 	}
 }
 
+func TestMigratesLegacyIDPrefixes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE assigned_ids(tool TEXT NOT NULL, session_id TEXT NOT NULL, source_path TEXT NOT NULL, id TEXT NOT NULL UNIQUE, PRIMARY KEY (tool, session_id, source_path));
+CREATE TABLE sessions(id TEXT PRIMARY KEY, tool TEXT NOT NULL, source_path TEXT NOT NULL, session_id TEXT NOT NULL, title TEXT NOT NULL, first_prompt TEXT NOT NULL, cwd TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, file_size_bytes INTEGER NOT NULL, message_count INTEGER NOT NULL, resume_argv TEXT NOT NULL, resume_command TEXT NOT NULL, generated_title TEXT NOT NULL DEFAULT '', generated_summary TEXT NOT NULL DEFAULT '', generated_at TEXT NOT NULL DEFAULT '', generated_by TEXT NOT NULL DEFAULT '', summary_status TEXT NOT NULL DEFAULT 'pending', summary_error TEXT NOT NULL DEFAULT '');
+CREATE VIRTUAL TABLE sessions_fts USING fts5(id UNINDEXED, title, first_prompt, cwd, transcript_text);
+INSERT INTO assigned_ids(tool, session_id, source_path, id) VALUES('codex', 'abcdef123456', '/tmp/codex.jsonl', 'codex:abcdef12');
+INSERT INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command) VALUES('codex:abcdef12', 'codex', '/tmp/codex.jsonl', 'abcdef123456', 'Legacy codex', 'Legacy codex', '/tmp/project', '2026-05-13T10:00:00Z', '2026-05-13T11:00:00Z', 1, 1, '["codex","resume","abcdef123456"]', 'cd /tmp/project && exec codex resume abcdef123456');
+INSERT INTO sessions_fts(id, title, first_prompt, cwd, transcript_text) VALUES('codex:abcdef12', 'Legacy codex', 'Legacy codex', '/tmp/project', 'legacy transcript');
+PRAGMA user_version=3;
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := Store{Path: path}
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := store.AssignedIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids["codex\x00abcdef123456\x00/tmp/codex.jsonl"] != "cx:abcdef12" {
+		t.Fatalf("assigned IDs not migrated: %#v", ids)
+	}
+	results, err := store.Search("legacy", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ID != "cx:abcdef12" {
+		t.Fatalf("results = %#v", results)
+	}
+}
+
 func TestGetReportsInvalidStoredResumeArgv(t *testing.T) {
 	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
 	rec := session.Record{
@@ -315,14 +359,14 @@ func TestGetReportsInvalidStoredResumeArgv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE sessions SET resume_argv = ? WHERE id = ?`, "{not-json", "codex:badargv1"); err != nil {
+	if _, err := db.Exec(`UPDATE sessions SET resume_argv = ? WHERE id = ?`, "{not-json", "cx:badargv1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = store.Get("codex:badargv1")
+	_, err = store.Get("cx:badargv1")
 	if err == nil || !strings.Contains(err.Error(), "invalid stored resume_argv") {
 		t.Fatalf("err = %v", err)
 	}

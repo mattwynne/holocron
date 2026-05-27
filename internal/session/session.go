@@ -330,13 +330,29 @@ func nextStableID(rec Record, used map[string]bool) string {
 	if sid == "" {
 		sid = hash8(rec.SourcePath)
 	}
+	prefix := ToolIDPrefix(rec.Tool)
 	for n := 8; n <= len(sid); n++ {
-		id := fmt.Sprintf("%s:%s", rec.Tool, sid[:n])
+		id := fmt.Sprintf("%s:%s", prefix, sid[:n])
 		if !used[id] {
 			return id
 		}
 	}
-	return fmt.Sprintf("%s:%s-%s", rec.Tool, sid, hash8(rec.SourcePath))
+	return fmt.Sprintf("%s:%s-%s", prefix, sid, hash8(rec.SourcePath))
+}
+
+func ToolIDPrefix(tool Tool) string {
+	switch tool {
+	case ToolPi:
+		return "pi"
+	case ToolClaude:
+		return "cd"
+	case ToolCodex:
+		return "cx"
+	case ToolGemini:
+		return "gm"
+	default:
+		return string(tool)
+	}
 }
 
 func hash8(s string) string {
