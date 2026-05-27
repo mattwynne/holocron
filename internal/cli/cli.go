@@ -240,7 +240,7 @@ func (a App) summarize(args []string) error {
 	}
 	var todo []index.SearchResult
 	for _, r := range results {
-		if r.GeneratedTitle == "" || opts.Force {
+		if opts.Force || r.SummaryStatus != "done" {
 			todo = append(todo, r)
 		}
 	}

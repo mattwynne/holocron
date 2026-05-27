@@ -182,6 +182,39 @@ func TestGeneratedTitleIsUsedWhenProviderTitleIsFallback(t *testing.T) {
 	}
 }
 
+func TestProviderNamedSessionsAreNotPendingSummaries(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	rec := session.Record{
+		Tool:          session.ToolPi,
+		SourcePath:    filepath.Join(t.TempDir(), "pi.jsonl"),
+		SessionID:     "named123456",
+		Title:         "User named session",
+		FirstPrompt:   "please help",
+		CWD:           "/tmp/project",
+		CreatedAt:     time.Date(2026, 5, 13, 10, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 5, 13, 11, 0, 0, 0, time.UTC),
+		ResumeArgv:    []string{"pi", "--session", "pi.jsonl"},
+		ResumeCommand: "cd /tmp/project && exec pi --session pi.jsonl",
+	}
+	if err := store.Rebuild([]session.Record{rec}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PendingSummaries(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("provider-named session should not be pending: %#v", pending)
+	}
+	results, err := store.Recent(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].SummaryStatus != "done" {
+		t.Fatalf("named session should be done: %#v", results)
+	}
+}
+
 func TestPendingSummaryStatusLifecycle(t *testing.T) {
 	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
 	rec := session.Record{

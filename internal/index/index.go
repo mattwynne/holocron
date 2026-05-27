@@ -398,6 +398,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(id UNINDEXED, title, 
 			return err
 		}
 	}
+	if err := markAlreadyNamedSessionsDone(db); err != nil {
+		return err
+	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", SchemaVersion)); err != nil {
 		return fmt.Errorf("store schema version: %w", err)
 	}
@@ -475,7 +478,7 @@ func upsertSessionWithGenerated(db dbtx, rec session.Record, existing storedRow)
 	created := rec.CreatedAt.UTC().Format(time.RFC3339)
 	updated := rec.UpdatedAt.UTC().Format(time.RFC3339)
 	if existing.SummaryStatus == "" {
-		if existing.GeneratedTitle != "" || existing.GeneratedSummary != "" {
+		if existing.GeneratedTitle != "" || existing.GeneratedSummary != "" || hasProviderTitle(rec.Title, rec.FirstPrompt) {
 			existing.SummaryStatus = "done"
 		} else {
 			existing.SummaryStatus = "pending"
@@ -513,11 +516,11 @@ func (s Store) UpdateGenerated(id, title, summary, generatedBy string, at time.T
 }
 
 func (s Store) MissingGenerated(limit int) ([]SearchResult, error) {
-	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' ORDER BY updated_at DESC LIMIT ?`, limit)
+	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' AND NOT (`+providerTitleSQL()+`) ORDER BY updated_at DESC LIMIT ?`, limit)
 }
 
 func (s Store) PendingSummaries(limit int) ([]SearchResult, error) {
-	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' AND summary_status IN ('pending', 'failed', 'running') ORDER BY updated_at DESC LIMIT ?`, limit)
+	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' AND NOT (`+providerTitleSQL()+`) AND summary_status IN ('pending', 'failed', 'running') ORDER BY updated_at DESC LIMIT ?`, limit)
 }
 
 func (s Store) SetSummaryStatus(id, status, message string) error {
@@ -537,7 +540,7 @@ func (s Store) SetSummaryStatus(id, status, message string) error {
 }
 
 func displayTitle(row storedRow) string {
-	if row.Title != "" && row.Title != row.FirstPrompt && row.Title != "(untitled session)" {
+	if hasProviderTitle(row.Title, row.FirstPrompt) {
 		return row.Title
 	}
 	if row.GeneratedTitle != "" {
@@ -550,6 +553,19 @@ func displayTitle(row storedRow) string {
 		return row.Title
 	}
 	return "(untitled session)"
+}
+
+func hasProviderTitle(title, firstPrompt string) bool {
+	return title != "" && title != firstPrompt && title != "(untitled session)"
+}
+
+func providerTitleSQL() string {
+	return `title <> '' AND title <> first_prompt AND title <> '(untitled session)'`
+}
+
+func markAlreadyNamedSessionsDone(db *sql.DB) error {
+	_, err := db.Exec(`UPDATE sessions SET summary_status = 'done', summary_error = '' WHERE generated_title <> '' OR generated_summary <> '' OR (` + providerTitleSQL() + `)`)
+	return err
 }
 
 func deleteID(db dbtx, id string) error {
