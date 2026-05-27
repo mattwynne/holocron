@@ -97,6 +97,61 @@ func TestSearchUsesBoundParametersForQuotesAndMetacharacters(t *testing.T) {
 	}
 }
 
+func TestUpdatedBetweenReturnsSessionsAcrossToolsNewestFirst(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	records := []session.Record{
+		{
+			Tool:          session.ToolCodex,
+			SourcePath:    filepath.Join(t.TempDir(), "codex.jsonl"),
+			SessionID:     "codextoday123456",
+			Title:         "Codex today",
+			FirstPrompt:   "Codex today",
+			CWD:           "/tmp/project",
+			CreatedAt:     time.Date(2026, 5, 27, 9, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, 5, 27, 10, 0, 0, 0, time.UTC),
+			ResumeArgv:    []string{"codex", "resume", "codextoday123456"},
+			ResumeCommand: "cd /tmp/project && exec codex resume codextoday123456",
+		},
+		{
+			Tool:          session.ToolClaude,
+			SourcePath:    filepath.Join(t.TempDir(), "claude.jsonl"),
+			SessionID:     "claudetoday123456",
+			Title:         "Claude today",
+			FirstPrompt:   "Claude today",
+			CWD:           "/tmp/project",
+			CreatedAt:     time.Date(2026, 5, 27, 11, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC),
+			ResumeArgv:    []string{"claude", "--resume", "claudetoday123456"},
+			ResumeCommand: "cd /tmp/project && exec claude --resume claudetoday123456",
+		},
+		{
+			Tool:          session.ToolPi,
+			SourcePath:    filepath.Join(t.TempDir(), "pi.jsonl"),
+			SessionID:     "piyesterday123456",
+			Title:         "Pi yesterday",
+			FirstPrompt:   "Pi yesterday",
+			CWD:           "/tmp/project",
+			CreatedAt:     time.Date(2026, 5, 26, 11, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC),
+			ResumeArgv:    []string{"pi", "--session", "pi.jsonl"},
+			ResumeCommand: "cd /tmp/project && exec pi --session pi.jsonl",
+		},
+	}
+	if err := store.Rebuild(records); err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.UpdatedBetween(time.Date(2026, 5, 27, 0, 0, 0, 0, time.UTC), time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %d", len(results))
+	}
+	if results[0].Tool != "claude" || results[1].Tool != "codex" {
+		t.Fatalf("results order/tools = %#v", results)
+	}
+}
+
 func TestGetReportsInvalidStoredResumeArgv(t *testing.T) {
 	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
 	rec := session.Record{

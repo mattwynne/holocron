@@ -162,6 +162,13 @@ func (s Store) Recent(limit int) ([]SearchResult, error) {
 FROM sessions ORDER BY updated_at DESC LIMIT ?`, limit)
 }
 
+func (s Store) UpdatedBetween(start, end time.Time, limit int) ([]SearchResult, error) {
+	return s.searchRows(`SELECT id, tool, title, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command
+FROM sessions
+WHERE updated_at >= ? AND updated_at < ?
+ORDER BY updated_at DESC LIMIT ?`, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), limit)
+}
+
 func (s Store) Get(id string) (session.Record, error) {
 	db, err := s.openInitialized()
 	if err != nil {

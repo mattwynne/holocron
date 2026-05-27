@@ -82,6 +82,53 @@ func TestSearchTableShowsFolder(t *testing.T) {
 	}
 }
 
+func TestTodayCommandListsSessionsUpdatedInLast24HoursAcrossAgents(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	codexRoot := filepath.Join(home, ".codex", "sessions", "2026")
+	claudeRoot := filepath.Join(home, ".claude", "projects", "-tmp-project")
+	for _, dir := range []string{project, codexRoot, claudeRoot} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(codexRoot, "today.jsonl"), strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"codextoday123456","timestamp":"2026-05-27T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Codex task today"}`,
+	}, "\n")+"\n")
+	writeFile(t, filepath.Join(claudeRoot, "today.jsonl"), strings.Join([]string{
+		`{"sessionId":"claudetoday123456","cwd":` + quote(project) + `,"timestamp":"2026-05-27T12:00:00Z"}`,
+		`{"role":"user","content":"Claude task today"}`,
+	}, "\n")+"\n")
+	writeFile(t, filepath.Join(codexRoot, "old.jsonl"), strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"codexold123456","timestamp":"2026-05-26T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Codex task too old"}`,
+	}, "\n")+"\n")
+
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Now: func() time.Time {
+		return time.Date(2026, 5, 27, 15, 0, 0, 0, time.UTC)
+	}}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HOLOCRON_SKIP_SERVICE_CHECK", "1")
+	var out bytes.Buffer
+	app.Stdout = &out
+	code := app.Run([]string{"today"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	for _, want := range []string{"TOOL", "claude", "Claude task today", "codex", "Codex task today"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("today output missing %q: %s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "too old") {
+		t.Fatalf("today output included session older than 24 hours: %s", out.String())
+	}
+}
+
 func TestRegisterSessionIndexesProjectLocalPiSession(t *testing.T) {
 	home := t.TempDir()
 	project := filepath.Join(home, "project")

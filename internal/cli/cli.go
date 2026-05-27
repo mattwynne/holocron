@@ -26,19 +26,23 @@ import (
 const serviceLabel = "net.mattwynne.holocron"
 
 type App struct {
-	Stdout io.Writer
-	Stderr io.Writer
-	Home   string
-	Exec   func(string, []string, []string) error
+	Stdout  io.Writer
+	Stderr  io.Writer
+	Home    string
+	Exec    func(string, []string, []string) error
+	Now     func() time.Time
+	Spinner bool
 }
 
 func New() App {
 	home, _ := os.UserHomeDir()
 	return App{
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
-		Home:   home,
-		Exec:   syscall.Exec,
+		Stdout:  os.Stdout,
+		Stderr:  os.Stderr,
+		Home:    home,
+		Exec:    syscall.Exec,
+		Now:     time.Now,
+		Spinner: true,
 	}
 }
 
@@ -57,6 +61,8 @@ func (a App) Run(args []string) int {
 		return 0
 	case "search":
 		err = a.search(args[1:])
+	case "today":
+		err = a.today(args[1:])
 	case "pick":
 		err = a.pick(args[1:])
 	case "open":
@@ -85,6 +91,7 @@ func (a App) Usage() {
 
 Usage:
   holocron search Q [--json]        Search indexed sessions
+  holocron today [--json]           List sessions updated in the last 24 hours
   holocron pick [Q]                 Pick and reopen a session in the TUI
   holocron open ID                  Reopen an indexed session
   holocron service COMMAND          Manage the background indexer
@@ -106,6 +113,8 @@ func (a App) search(args []string) error {
 	if query == "" {
 		return errors.New("search requires a non-empty query")
 	}
+	stop := a.startSpinner("Searching sessions")
+	defer stop()
 	if err := a.requireService(); err != nil {
 		return err
 	}
@@ -113,12 +122,39 @@ func (a App) search(args []string) error {
 	if err != nil {
 		return err
 	}
+	stop()
 	if jsonOut {
 		enc := json.NewEncoder(a.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(results)
 	}
 	printTable(a.Stdout, results)
+	return nil
+}
+
+func (a App) today(args []string) error {
+	jsonOut, err := parseTodayArgs(args)
+	if err != nil {
+		return err
+	}
+	stop := a.startSpinner("Loading recent sessions")
+	defer stop()
+	if err := a.requireService(); err != nil {
+		return err
+	}
+	end := a.now()
+	start := end.Add(-24 * time.Hour)
+	results, err := a.store().UpdatedBetween(start, end, 1000)
+	if err != nil {
+		return err
+	}
+	stop()
+	if jsonOut {
+		enc := json.NewEncoder(a.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(results)
+	}
+	printTodayTable(a.Stdout, results)
 	return nil
 }
 
@@ -186,6 +222,19 @@ func (a App) execResult(id string) error {
 	return a.Exec(bin, argv, os.Environ())
 }
 
+func parseTodayArgs(args []string) (bool, error) {
+	var jsonOut bool
+	for _, arg := range args {
+		switch arg {
+		case "--json":
+			jsonOut = true
+		default:
+			return false, fmt.Errorf("unknown today argument %s", arg)
+		}
+	}
+	return jsonOut, nil
+}
+
 func parseSearchArgs(args []string) (string, bool, error) {
 	var jsonOut bool
 	var terms []string
@@ -207,17 +256,108 @@ func printTable(w io.Writer, results []index.SearchResult) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tTOOL\tUPDATED\tSIZE\tFOLDER\tTITLE")
 	for _, r := range results {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, shortTime(r.UpdatedAt), r.Size, r.Folder, r.Title)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, shortDate(r.UpdatedAt), r.Size, r.Folder, r.Title)
 	}
 	_ = tw.Flush()
 }
 
-func shortTime(value string) string {
+func printTodayTable(w io.Writer, results []index.SearchResult) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tTOOL\tUPDATED\tSIZE\tFOLDER\tTITLE")
+	for _, r := range results {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, shortDateTime(r.UpdatedAt), r.Size, r.Folder, r.Title)
+	}
+	_ = tw.Flush()
+}
+
+func (a App) now() time.Time {
+	if a.Now != nil {
+		return a.Now()
+	}
+	return time.Now()
+}
+
+func (a App) startSpinner(label string) func() {
+	_, stop := a.startProgress(label)
+	return stop
+}
+
+func (a App) startProgress(label string) (func(string), func()) {
+	if !a.Spinner || !isTerminal(a.Stderr) {
+		return func(string) {}, func() {}
+	}
+	updates := make(chan string, 1)
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		current := label
+		for i := 0; ; i++ {
+			fmt.Fprintf(a.Stderr, "\r\033[K%s %s", frames[i%len(frames)], current)
+			select {
+			case <-done:
+				fmt.Fprint(a.Stderr, "\r\033[K")
+				return
+			case next := <-updates:
+				current = next
+			case <-ticker.C:
+			}
+		}
+	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			<-stopped
+		})
+	}
+	update := func(message string) {
+		select {
+		case updates <- message:
+		default:
+			select {
+			case <-updates:
+			default:
+			}
+			select {
+			case updates <- message:
+			default:
+			}
+		}
+	}
+	return update, stop
+}
+
+func compactProgressMessage(home, message string) string {
+	return strings.ReplaceAll(message, home, "~")
+}
+
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func shortDate(value string) string {
 	t, err := time.Parse(time.RFC3339, value)
 	if err != nil {
 		return value
 	}
 	return t.Local().Format("2006-01-02")
+}
+
+func shortDateTime(value string) string {
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return value
+	}
+	return t.Local().Format("2006-01-02 15:04")
 }
 
 func (a App) daemon() error {
@@ -278,10 +418,15 @@ func (a App) daemon() error {
 }
 
 func (a App) fullScan() error {
+	updateProgress, stopProgress := a.startProgress("Scanning sessions")
+	defer stopProgress()
 	opts := session.ParseOptions{
 		GeminiProjects: session.LoadGeminiProjects(a.Home),
 		Warnf: func(format string, args ...any) {
 			fmt.Fprintf(a.Stderr, "holocron parser: "+format+"\n", args...)
+		},
+		Progressf: func(format string, args ...any) {
+			updateProgress(compactProgressMessage(a.Home, fmt.Sprintf(format, args...)))
 		},
 	}
 	records, err := session.Discover(session.DefaultSources(a.Home), opts)
@@ -293,6 +438,7 @@ func (a App) fullScan() error {
 		return err
 	}
 	records = append(records, registered...)
+	updateProgress("Updating index")
 	return a.store().Rebuild(records)
 }
 
@@ -685,10 +831,11 @@ func (a App) ensurePiExtension() error {
 func holocronPiExtension(exe string) string {
 	exeJSON, _ := json.Marshal(exe)
 	return fmt.Sprintf(`import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 
 const HOLOCRON = %s;
+const REGISTER_TIMEOUT_MS = 5000;
 
 export default function (pi: ExtensionAPI) {
   let sessionFile: string | undefined;
@@ -696,17 +843,25 @@ export default function (pi: ExtensionAPI) {
   const register = () => {
     if (!sessionFile || process.env.HOLOCRON_REGISTER_SESSION === "0") return false;
     if (!existsSync(sessionFile)) return false;
-    spawnSync(HOLOCRON, ["register-session", "pi", sessionFile], {
+
+    const child = spawn(HOLOCRON, ["register-session", "pi", sessionFile], {
       stdio: "ignore",
-      timeout: 5000,
+      detached: true,
     });
+
+    const timeout = setTimeout(() => child.kill(), REGISTER_TIMEOUT_MS);
+    timeout.unref();
+    child.on("exit", () => clearTimeout(timeout));
+    child.unref();
+
     return true;
   };
 
   const registerSoon = (attempt = 0) => {
-    setTimeout(() => {
+    const timeout = setTimeout(() => {
       if (!register() && attempt < 20) registerSoon(attempt + 1);
     }, 250);
+    timeout.unref();
   };
 
   pi.on("session_start", async (_event, ctx) => {

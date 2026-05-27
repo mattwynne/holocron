@@ -49,6 +49,7 @@ type Source struct {
 type ParseOptions struct {
 	GeminiProjects map[string]string
 	Warnf          func(format string, args ...any)
+	Progressf      func(format string, args ...any)
 }
 
 func DefaultSources(home string) []Source {
@@ -80,6 +81,7 @@ func Discover(sources []Source, opts ParseOptions) ([]Record, error) {
 			if !matchesSource(src, path) {
 				return nil
 			}
+			progressf(opts, "Reading %s %s", src.Tool, path)
 			rec, err := ParseFile(src.Tool, src.Root, path, opts)
 			if err != nil {
 				warnf(opts, "%s: %v", path, err)
@@ -553,5 +555,11 @@ func compactValue(v any) string {
 func warnf(opts ParseOptions, format string, args ...any) {
 	if opts.Warnf != nil {
 		opts.Warnf(format, args...)
+	}
+}
+
+func progressf(opts ParseOptions, format string, args ...any) {
+	if opts.Progressf != nil {
+		opts.Progressf(format, args...)
 	}
 }
