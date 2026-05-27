@@ -103,7 +103,7 @@ Usage:
   holocron version                  Print version
 
 Service commands:
-  install, uninstall, start, stop, status`)
+  install, uninstall, start, stop, restart, status`)
 }
 
 func (a App) store() index.Store {
@@ -1108,7 +1108,7 @@ func readDaemonLockPID(path string) (int, bool) {
 
 func (a App) service(args []string) error {
 	if len(args) != 1 {
-		return errors.New("service requires one command: install, uninstall, start, stop, or status")
+		return errors.New("service requires one command: install, uninstall, start, stop, restart, or status")
 	}
 	switch args[0] {
 	case "install":
@@ -1116,12 +1116,11 @@ func (a App) service(args []string) error {
 	case "uninstall":
 		return a.serviceUninstall()
 	case "start":
-		if err := a.ensurePiExtension(); err != nil {
-			return err
-		}
-		return launchctl("bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plistPath(a.Home))
+		return a.serviceStart()
 	case "stop":
-		return launchctl("bootout", serviceTarget())
+		return a.serviceStop()
+	case "restart":
+		return a.serviceRestart()
 	case "status":
 		return a.serviceStatus()
 	default:
@@ -1162,6 +1161,22 @@ func (a App) serviceInstall() error {
 func (a App) serviceUninstall() error {
 	_ = launchctl("bootout", serviceTarget())
 	return os.Remove(plistPath(a.Home))
+}
+
+func (a App) serviceStart() error {
+	if err := a.ensurePiExtension(); err != nil {
+		return err
+	}
+	return launchctl("bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plistPath(a.Home))
+}
+
+func (a App) serviceStop() error {
+	return launchctl("bootout", serviceTarget())
+}
+
+func (a App) serviceRestart() error {
+	_ = a.serviceStop()
+	return a.serviceStart()
 }
 
 func (a App) ensurePiExtension() error {

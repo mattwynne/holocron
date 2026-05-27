@@ -106,6 +106,7 @@ Manage the service:
 holocron service status
 holocron service start
 holocron service stop
+holocron service restart
 holocron service uninstall
 ```
 
