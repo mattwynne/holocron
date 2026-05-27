@@ -174,6 +174,120 @@ func TestRegisterSessionIndexesProjectLocalPiSession(t *testing.T) {
 	}
 }
 
+func TestSummarizeDryRunUsesConfiguredModelCommand(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	srcRoot := filepath.Join(home, ".codex", "sessions")
+	for _, dir := range []string{project, srcRoot, filepath.Join(home, ".config", "holocron")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := filepath.Join(home, "model")
+	writeFile(t, script, "#!/bin/sh\necho '{\"title\":\"Summarize sessions\",\"summary\":\"Generated a Holocron session summary.\",\"status\":\"implemented\",\"key_files\":[],\"confidence\":\"high\"}'\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[summarizer]\ncommand = ["+quote(script)+"]\n")
+	sessionFile := filepath.Join(srcRoot, "codex.jsonl")
+	writeFile(t, sessionFile, strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"sum123456789","timestamp":"2026-05-13T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Summarize my sessions"}`,
+	}, "\n")+"\n")
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	app.Stdout = &out
+	if code := app.Run([]string{"summarize", "codex:sum12345", "--dry-run", "--json"}); code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	if !strings.Contains(out.String(), `"title": "Summarize sessions"`) || !strings.Contains(out.String(), `"dry_run": true`) {
+		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestSummarizeSkipsExistingGeneratedMetadataWithoutForce(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	srcRoot := filepath.Join(home, ".codex", "sessions")
+	for _, dir := range []string{project, srcRoot, filepath.Join(home, ".config", "holocron")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	marker := filepath.Join(home, "model-was-called")
+	script := filepath.Join(home, "model")
+	writeFile(t, script, "#!/bin/sh\ntouch "+quote(marker)+"\necho '{\"title\":\"New title\",\"summary\":\"New summary.\",\"status\":\"implemented\",\"key_files\":[],\"confidence\":\"high\"}'\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[summarizer]\ncommand = ["+quote(script)+"]\n")
+	sessionFile := filepath.Join(srcRoot, "codex.jsonl")
+	writeFile(t, sessionFile, strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"skip123456789","timestamp":"2026-05-13T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Already summarized"}`,
+	}, "\n")+"\n")
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().UpdateGenerated("codex:skip1234", "Existing title", "Existing summary.", "test", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	app.Stdout = &out
+	if code := app.Run([]string{"summarize", "codex:skip1234", "--json"}); code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	if strings.TrimSpace(out.String()) != "[]" {
+		t.Fatalf("expected no work, got: %s", out.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("model command should not have been called, stat err=%v", err)
+	}
+}
+
+func TestSummarizeTodayOnlyUsesLast24Hours(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	srcRoot := filepath.Join(home, ".codex", "sessions")
+	for _, dir := range []string{project, srcRoot, filepath.Join(home, ".config", "holocron")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := filepath.Join(home, "model")
+	writeFile(t, script, "#!/bin/sh\necho '{\"title\":\"Today summary\",\"summary\":\"Summarized a recent session.\",\"status\":\"implemented\",\"key_files\":[],\"confidence\":\"high\"}'\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[summarizer]\ncommand = ["+quote(script)+"]\n")
+	writeFile(t, filepath.Join(srcRoot, "today.jsonl"), strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"today123456789","timestamp":"2026-05-27T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Summarize today"}`,
+	}, "\n")+"\n")
+	writeFile(t, filepath.Join(srcRoot, "old.jsonl"), strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"old1234567890","timestamp":"2026-05-26T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Too old"}`,
+	}, "\n")+"\n")
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false, Now: func() time.Time {
+		return time.Date(2026, 5, 27, 15, 0, 0, 0, time.UTC)
+	}}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	app.Stdout = &out
+	if code := app.Run([]string{"summarize", "--today", "--dry-run", "--json"}); code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	if !strings.Contains(out.String(), `"id": "codex:today123"`) || strings.Contains(out.String(), "old123") {
+		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
 func TestOpenValidatesCWDAndExecsArgv(t *testing.T) {
 	home := t.TempDir()
 	binDir := filepath.Join(home, "bin")
@@ -229,6 +343,23 @@ func TestOpenValidatesCWDAndExecsArgv(t *testing.T) {
 	}
 	if strings.Join(gotArgv, " ") != "codex resume abcdef1234567890" {
 		t.Fatalf("argv = %#v", gotArgv)
+	}
+}
+
+func TestDaemonRunningFastUsesLockPIDWithoutLaunchctl(t *testing.T) {
+	home := t.TempDir()
+	lockPath := filepath.Join(home, ".local", "share", "holocron", "daemon.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, lockPath, fmt.Sprintf("%d 2026-05-13T10:00:00Z\n", os.Getpid()))
+	app := App{Home: home}
+	if !app.daemonRunningFast() {
+		t.Fatal("expected daemon lock for current pid to be running")
+	}
+	writeFile(t, lockPath, "99999999 2026-05-13T10:00:00Z\n")
+	if app.daemonRunningFast() {
+		t.Fatal("expected stale daemon lock to report not running")
 	}
 }
 

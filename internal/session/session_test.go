@@ -216,3 +216,18 @@ func quoteJSON(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+func TestDetectsHolocronSummarizerBackendSessions(t *testing.T) {
+	rec := Record{Tool: ToolPi, FirstPrompt: "Summarize chunk 1/3 of a coding-agent session. Return strict JSON only."}
+	if !IsHolocronSummarizerRecord(rec) {
+		t.Fatal("expected summarizer backend session to be detected")
+	}
+	rec = Record{Tool: ToolPi, FirstPrompt: "Name and summarize this coding-agent session. Return strict JSON only."}
+	if !IsHolocronSummarizerRecord(rec) {
+		t.Fatal("expected final summarizer backend session to be detected")
+	}
+	rec = Record{Tool: ToolPi, FirstPrompt: "Implement Holocron session summarization"}
+	if IsHolocronSummarizerRecord(rec) {
+		t.Fatal("expected normal session not to be detected as summarizer backend")
+	}
+}

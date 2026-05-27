@@ -47,9 +47,10 @@ type Source struct {
 }
 
 type ParseOptions struct {
-	GeminiProjects map[string]string
-	Warnf          func(format string, args ...any)
-	Progressf      func(format string, args ...any)
+	GeminiProjects                   map[string]string
+	DeleteHolocronSummarizerSessions bool
+	Warnf                            func(format string, args ...any)
+	Progressf                        func(format string, args ...any)
 }
 
 func DefaultSources(home string) []Source {
@@ -85,6 +86,14 @@ func Discover(sources []Source, opts ParseOptions) ([]Record, error) {
 			rec, err := ParseFile(src.Tool, src.Root, path, opts)
 			if err != nil {
 				warnf(opts, "%s: %v", path, err)
+				return nil
+			}
+			if IsHolocronSummarizerRecord(rec) {
+				if opts.DeleteHolocronSummarizerSessions {
+					if err := os.Remove(path); err != nil {
+						warnf(opts, "%s: remove holocron summarizer session: %v", path, err)
+					}
+				}
 				return nil
 			}
 			out = append(out, rec)
@@ -248,6 +257,16 @@ func applyCommon(tool Tool, rec *Record, obj map[string]any, root, path string, 
 			rec.UpdatedAt = ts
 		}
 	}
+}
+
+func IsHolocronSummarizerRecord(rec Record) bool {
+	if rec.Tool != ToolPi {
+		return false
+	}
+	text := strings.TrimSpace(firstNonEmpty(rec.FirstPrompt, rec.Transcript, rec.Title))
+	return strings.HasPrefix(text, "Summarize chunk ") ||
+		strings.HasPrefix(text, "Name and summarize this coding-agent session.") ||
+		strings.HasPrefix(text, "Repair this response into strict JSON")
 }
 
 func ResumeArgv(rec Record) []string {

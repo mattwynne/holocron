@@ -68,6 +68,32 @@ Open a result by ID:
 holocron open pi:019e31be
 ```
 
+Generate Holocron-native titles and summaries:
+
+```sh
+holocron summarize pi:019e31be
+holocron summarize --today --limit 20
+holocron summarize --missing --limit 20
+holocron summarize --recent --limit 20 --jobs 4 --dry-run --json
+```
+
+Summaries are stored only in Holocron's SQLite index. Holocron never writes generated metadata back to provider session files. Configure the model command in `~/.config/holocron/config.toml`; it receives a prompt on stdin and must return strict JSON on stdout:
+
+```toml
+[summarizer]
+command = ["pi", "-p", "--no-tools"]
+max_input_tokens = 4000
+chunk_tokens = 6000
+max_chunks = 20
+timeout_seconds = 120
+
+# Queue-style background summarization in the daemon. Indexing stays fast;
+# missing titles populate gradually for UIs that poll search/today results.
+background = true
+background_interval_seconds = 30
+background_jobs = 1
+```
+
 Manually register a Pi session outside the default session tree:
 
 ```sh
@@ -87,6 +113,14 @@ holocron service uninstall
 
 ```sh
 direnv allow
-go test ./...
-go run ./cmd/holocron help
+just build      # writes ./holocron
+just test       # runs go test ./...
+just install    # installs holocron on your Go bin path
+```
+
+Without `just`:
+
+```sh
+go build -o holocron ./cmd/holocron
+./holocron help
 ```

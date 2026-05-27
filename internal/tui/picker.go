@@ -29,21 +29,31 @@ type searchMsg struct {
 
 type debounceMsg struct{ query string }
 
+type statusMsg string
+
 type Model struct {
-	store    Store
-	query    string
-	results  []index.SearchResult
-	selected int
-	loading  bool
-	err      error
-	choice   string
-	cancel   bool
-	width    int
-	height   int
+	store       Store
+	query       string
+	results     []index.SearchResult
+	selected    int
+	loading     bool
+	err         error
+	choice      string
+	cancel      bool
+	width       int
+	height      int
+	status      string
+	statusCheck func() string
 }
 
 func Pick(store Store, initialQuery string, stdout, stderr io.Writer) (Result, error) {
+	return PickWithStatus(store, initialQuery, stdout, stderr, nil)
+}
+
+func PickWithStatus(store Store, initialQuery string, stdout, stderr io.Writer, statusCheck func() string) (Result, error) {
 	m := NewModel(store, initialQuery)
+	m.status = "checking daemon..."
+	m.statusCheck = statusCheck
 	program := tea.NewProgram(m, tea.WithOutput(stdout), tea.WithAltScreen())
 	finalModel, err := program.Run()
 	if err != nil {
@@ -64,7 +74,11 @@ func NewModel(store Store, initialQuery string) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return m.runSearch(m.query)
+	cmds := []tea.Cmd{m.runSearch(m.query)}
+	if m.statusCheck != nil {
+		cmds = append(cmds, m.runStatusCheck())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -72,6 +86,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		return m, nil
+	case statusMsg:
+		m.status = string(msg)
 		return m, nil
 	case searchMsg:
 		if msg.query != m.query {
@@ -167,7 +184,11 @@ func (m Model) View() string {
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 
-	fmt.Fprintf(&b, "%s %s\n", titleStyle.Render("Holocron"), muted.Render("type to search • enter open • esc quit"))
+	help := "type to search • enter open • esc quit"
+	if m.status != "" {
+		help += " • " + m.status
+	}
+	fmt.Fprintf(&b, "%s %s\n", titleStyle.Render("Holocron"), muted.Render(help))
 	fmt.Fprintf(&b, "> %s\n\n", m.query)
 
 	if m.err != nil {
@@ -240,6 +261,15 @@ func sizeBar(value, max int64, width int) string {
 		}
 	}
 	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+}
+
+func (m Model) runStatusCheck() tea.Cmd {
+	return func() tea.Msg {
+		if m.statusCheck == nil {
+			return statusMsg("")
+		}
+		return statusMsg(m.statusCheck())
+	}
 }
 
 func (m Model) runSearch(query string) tea.Cmd {

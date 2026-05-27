@@ -15,40 +15,52 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 3
 
 type Store struct {
 	Path string
 }
 
 type SearchResult struct {
-	ID            string   `json:"id"`
-	Tool          string   `json:"tool"`
-	Title         string   `json:"title"`
-	Folder        string   `json:"folder"`
-	CWD           string   `json:"cwd"`
-	UpdatedAt     string   `json:"updated_at"`
-	Size          string   `json:"size"`
-	FileSizeBytes int64    `json:"file_size_bytes"`
-	MessageCount  int      `json:"message_count"`
-	ResumeArgv    []string `json:"resume_argv"`
-	ResumeCommand string   `json:"resume_command"`
+	ID               string   `json:"id"`
+	Tool             string   `json:"tool"`
+	Title            string   `json:"title"`
+	Folder           string   `json:"folder"`
+	CWD              string   `json:"cwd"`
+	UpdatedAt        string   `json:"updated_at"`
+	Size             string   `json:"size"`
+	FileSizeBytes    int64    `json:"file_size_bytes"`
+	MessageCount     int      `json:"message_count"`
+	ResumeArgv       []string `json:"resume_argv"`
+	ResumeCommand    string   `json:"resume_command"`
+	GeneratedTitle   string   `json:"generated_title,omitempty"`
+	GeneratedSummary string   `json:"generated_summary,omitempty"`
+	GeneratedAt      string   `json:"generated_at,omitempty"`
+	GeneratedBy      string   `json:"generated_by,omitempty"`
+	SummaryStatus    string   `json:"summary_status,omitempty"`
+	SummaryError     string   `json:"summary_error,omitempty"`
 }
 
 type storedRow struct {
-	ID            string
-	Tool          string
-	SourcePath    string
-	SessionID     string
-	Title         string
-	FirstPrompt   string
-	CWD           string
-	CreatedAt     string
-	UpdatedAt     string
-	FileSizeBytes int64
-	MessageCount  int
-	ResumeArgv    string
-	ResumeCommand string
+	ID               string
+	Tool             string
+	SourcePath       string
+	SessionID        string
+	Title            string
+	FirstPrompt      string
+	CWD              string
+	CreatedAt        string
+	UpdatedAt        string
+	FileSizeBytes    int64
+	MessageCount     int
+	ResumeArgv       string
+	ResumeCommand    string
+	GeneratedTitle   string
+	GeneratedSummary string
+	GeneratedAt      string
+	GeneratedBy      string
+	SummaryStatus    string
+	SummaryError     string
 }
 
 type dbtx interface {
@@ -81,6 +93,10 @@ func (s Store) Rebuild(records []session.Record) error {
 		return err
 	}
 	records = session.AssignStableIDs(records, existing)
+	generated, err := generatedByID(db)
+	if err != nil {
+		return err
+	}
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -98,7 +114,11 @@ func (s Store) Rebuild(records []session.Record) error {
 		if err = insertAssignedID(tx, rec); err != nil {
 			return err
 		}
-		if err = upsertSession(tx, rec); err != nil {
+		if existingGenerated, ok := generated[rec.ID]; ok {
+			if err = upsertSessionWithGenerated(tx, rec, existingGenerated); err != nil {
+				return err
+			}
+		} else if err = upsertSession(tx, rec); err != nil {
 			return err
 		}
 	}
@@ -150,7 +170,7 @@ func (s Store) Search(query string, limit int) ([]SearchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return s.Recent(limit)
 	}
-	return s.searchRows(`SELECT s.id, s.tool, s.title, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command
+	return s.readRows(`SELECT s.id, s.tool, s.title, s.first_prompt, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command, s.generated_title, s.generated_summary, s.generated_at, s.generated_by, s.summary_status, s.summary_error
 FROM sessions_fts f JOIN sessions s ON s.id = f.id
 WHERE sessions_fts MATCH ?
 ORDER BY bm25(sessions_fts, 10.0, 10.0, 3.0, 1.0)
@@ -158,15 +178,27 @@ LIMIT ?`, ftsQuery(query), limit)
 }
 
 func (s Store) Recent(limit int) ([]SearchResult, error) {
-	return s.searchRows(`SELECT id, tool, title, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command
+	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error
 FROM sessions ORDER BY updated_at DESC LIMIT ?`, limit)
 }
 
 func (s Store) UpdatedBetween(start, end time.Time, limit int) ([]SearchResult, error) {
-	return s.searchRows(`SELECT id, tool, title, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command
+	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error
 FROM sessions
 WHERE updated_at >= ? AND updated_at < ?
 ORDER BY updated_at DESC LIMIT ?`, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), limit)
+}
+
+func (s Store) Lookup(id string) (SearchResult, error) {
+	rows, err := s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error
+FROM sessions WHERE id = ?`, id)
+	if err != nil {
+		return SearchResult{}, err
+	}
+	if len(rows) == 0 {
+		return SearchResult{}, os.ErrNotExist
+	}
+	return rows[0], nil
 }
 
 func (s Store) Get(id string) (session.Record, error) {
@@ -176,7 +208,7 @@ func (s Store) Get(id string) (session.Record, error) {
 	}
 	defer db.Close()
 
-	rows, err := queryStoredRows(db, `SELECT id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command FROM sessions WHERE id = ?`, id)
+	rows, err := queryStoredRows(db, `SELECT id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by FROM sessions WHERE id = ?`, id)
 	if err != nil {
 		return session.Record{}, err
 	}
@@ -238,8 +270,8 @@ func (s Store) DeleteSource(path string) error {
 	return err
 }
 
-func (s Store) searchRows(query string, args ...any) ([]SearchResult, error) {
-	db, err := s.openInitialized()
+func (s Store) readRows(query string, args ...any) ([]SearchResult, error) {
+	db, err := s.openReadOnly()
 	if err != nil {
 		return nil, err
 	}
@@ -255,20 +287,39 @@ func (s Store) searchRows(query string, args ...any) ([]SearchResult, error) {
 			return nil, err
 		}
 		out = append(out, SearchResult{
-			ID:            row.ID,
-			Tool:          row.Tool,
-			Title:         row.Title,
-			Folder:        FolderName(row.CWD),
-			CWD:           row.CWD,
-			UpdatedAt:     row.UpdatedAt,
-			Size:          HumanSize(row.FileSizeBytes),
-			FileSizeBytes: row.FileSizeBytes,
-			MessageCount:  row.MessageCount,
-			ResumeArgv:    argv,
-			ResumeCommand: row.ResumeCommand,
+			ID:               row.ID,
+			Tool:             row.Tool,
+			Title:            displayTitle(row),
+			Folder:           FolderName(row.CWD),
+			CWD:              row.CWD,
+			UpdatedAt:        row.UpdatedAt,
+			Size:             HumanSize(row.FileSizeBytes),
+			FileSizeBytes:    row.FileSizeBytes,
+			MessageCount:     row.MessageCount,
+			ResumeArgv:       argv,
+			ResumeCommand:    row.ResumeCommand,
+			GeneratedTitle:   row.GeneratedTitle,
+			GeneratedSummary: row.GeneratedSummary,
+			GeneratedAt:      row.GeneratedAt,
+			GeneratedBy:      row.GeneratedBy,
+			SummaryStatus:    row.SummaryStatus,
+			SummaryError:     row.SummaryError,
 		})
 	}
 	return out, nil
+}
+
+func (s Store) openReadOnly() (*sql.DB, error) {
+	if _, err := os.Stat(s.Path); err != nil {
+		return nil, err
+	}
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(500)", filepath.ToSlash(s.Path))
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
 }
 
 func (s Store) openInitialized() (*sql.DB, error) {
@@ -298,10 +349,11 @@ func initSchema(db *sql.DB) error {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
-	if version != 0 && version != SchemaVersion {
+	if version != 0 && version > SchemaVersion {
 		if _, err := db.Exec(`DROP TABLE IF EXISTS sessions_fts; DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS assigned_ids;`); err != nil {
 			return fmt.Errorf("rebuild incompatible schema version %d: %w", version, err)
 		}
+		version = 0
 	}
 	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS assigned_ids (
@@ -324,16 +376,59 @@ CREATE TABLE IF NOT EXISTS sessions (
   file_size_bytes INTEGER NOT NULL,
   message_count INTEGER NOT NULL,
   resume_argv TEXT NOT NULL,
-  resume_command TEXT NOT NULL
+  resume_command TEXT NOT NULL,
+  generated_title TEXT NOT NULL DEFAULT '',
+  generated_summary TEXT NOT NULL DEFAULT '',
+  generated_at TEXT NOT NULL DEFAULT '',
+  generated_by TEXT NOT NULL DEFAULT '',
+  summary_status TEXT NOT NULL DEFAULT 'pending',
+  summary_error TEXT NOT NULL DEFAULT ''
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(id UNINDEXED, title, first_prompt, cwd, transcript_text);
 `); err != nil {
 		return fmt.Errorf("initialize sqlite schema, including FTS5 table: %w", err)
 	}
+	if version < 2 {
+		if err := addGeneratedColumns(db); err != nil {
+			return err
+		}
+	}
+	if version < 3 {
+		if err := addSummaryStatusColumns(db); err != nil {
+			return err
+		}
+	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", SchemaVersion)); err != nil {
 		return fmt.Errorf("store schema version: %w", err)
 	}
 	return nil
+}
+
+func addGeneratedColumns(db *sql.DB) error {
+	for _, stmt := range []string{
+		`ALTER TABLE sessions ADD COLUMN generated_title TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN generated_summary TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN generated_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN generated_by TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") && !strings.Contains(err.Error(), "no such table") {
+			return fmt.Errorf("migrate generated metadata: %w", err)
+		}
+	}
+	return nil
+}
+
+func addSummaryStatusColumns(db *sql.DB) error {
+	for _, stmt := range []string{
+		`ALTER TABLE sessions ADD COLUMN summary_status TEXT NOT NULL DEFAULT 'pending'`,
+		`ALTER TABLE sessions ADD COLUMN summary_error TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") && !strings.Contains(err.Error(), "no such table") {
+			return fmt.Errorf("migrate summary status: %w", err)
+		}
+	}
+	_, err := db.Exec(`UPDATE sessions SET summary_status = 'done' WHERE generated_title <> '' OR generated_summary <> ''`)
+	return err
 }
 
 func assignedIDs(db dbtx) (map[string]string, error) {
@@ -353,22 +448,108 @@ func insertAssignedID(db dbtx, rec session.Record) error {
 	return err
 }
 
+func generatedByID(db dbtx) (map[string]storedRow, error) {
+	rows, err := queryStoredRows(db, `SELECT id, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title <> '' OR generated_summary <> '' OR summary_status <> 'pending' OR summary_error <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]storedRow{}
+	for _, row := range rows {
+		out[row.ID] = row
+	}
+	return out, nil
+}
+
 func upsertSession(db dbtx, rec session.Record) error {
+	if rows, err := queryStoredRows(db, `SELECT generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE id = ?`, rec.ID); err == nil && len(rows) > 0 {
+		return upsertSessionWithGenerated(db, rec, rows[0])
+	}
+	return upsertSessionWithGenerated(db, rec, storedRow{})
+}
+
+func upsertSessionWithGenerated(db dbtx, rec session.Record, existing storedRow) error {
 	argv, err := json.Marshal(rec.ResumeArgv)
 	if err != nil {
 		return err
 	}
 	created := rec.CreatedAt.UTC().Format(time.RFC3339)
 	updated := rec.UpdatedAt.UTC().Format(time.RFC3339)
-	if _, err := db.Exec(`INSERT OR REPLACE INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.ID, string(rec.Tool), rec.SourcePath, rec.SessionID, rec.Title, rec.FirstPrompt, rec.CWD, created, updated, rec.FileSizeBytes, rec.MessageCount, string(argv), rec.ResumeCommand); err != nil {
+	if existing.SummaryStatus == "" {
+		if existing.GeneratedTitle != "" || existing.GeneratedSummary != "" {
+			existing.SummaryStatus = "done"
+		} else {
+			existing.SummaryStatus = "pending"
+		}
+	}
+	display := displayTitle(storedRow{Title: rec.Title, FirstPrompt: rec.FirstPrompt, GeneratedTitle: existing.GeneratedTitle})
+	if _, err := db.Exec(`INSERT OR REPLACE INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.ID, string(rec.Tool), rec.SourcePath, rec.SessionID, rec.Title, rec.FirstPrompt, rec.CWD, created, updated, rec.FileSizeBytes, rec.MessageCount, string(argv), rec.ResumeCommand, existing.GeneratedTitle, existing.GeneratedSummary, existing.GeneratedAt, existing.GeneratedBy, existing.SummaryStatus, existing.SummaryError); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`DELETE FROM sessions_fts WHERE id = ?`, rec.ID); err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO sessions_fts(id, title, first_prompt, cwd, transcript_text) VALUES(?, ?, ?, ?, ?)`, rec.ID, rec.Title, rec.FirstPrompt, rec.CWD, rec.Transcript)
+	_, err = db.Exec(`INSERT INTO sessions_fts(id, title, first_prompt, cwd, transcript_text) VALUES(?, ?, ?, ?, ?)`, rec.ID, display, rec.FirstPrompt, rec.CWD, rec.Transcript)
 	return err
+}
+
+func (s Store) UpdateGenerated(id, title, summary, generatedBy string, at time.Time) error {
+	db, err := s.openInitialized()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	res, err := db.Exec(`UPDATE sessions SET generated_title = ?, generated_summary = ?, generated_at = ?, generated_by = ?, summary_status = 'done', summary_error = '' WHERE id = ?`, title, summary, at.UTC().Format(time.RFC3339), generatedBy, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return os.ErrNotExist
+	}
+	if _, err := db.Exec(`UPDATE sessions_fts SET title = ? WHERE id = ?`, title, id); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s Store) MissingGenerated(limit int) ([]SearchResult, error) {
+	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' ORDER BY updated_at DESC LIMIT ?`, limit)
+}
+
+func (s Store) PendingSummaries(limit int) ([]SearchResult, error) {
+	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' AND summary_status IN ('pending', 'failed', 'running') ORDER BY updated_at DESC LIMIT ?`, limit)
+}
+
+func (s Store) SetSummaryStatus(id, status, message string) error {
+	db, err := s.openInitialized()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	res, err := db.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND generated_title = ''`, status, message, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+func displayTitle(row storedRow) string {
+	if row.Title != "" && row.Title != row.FirstPrompt && row.Title != "(untitled session)" {
+		return row.Title
+	}
+	if row.GeneratedTitle != "" {
+		return row.GeneratedTitle
+	}
+	if row.FirstPrompt != "" {
+		return row.FirstPrompt
+	}
+	if row.Title != "" {
+		return row.Title
+	}
+	return "(untitled session)"
 }
 
 func deleteID(db dbtx, id string) error {
@@ -432,6 +613,18 @@ func queryStoredRows(db dbtx, query string, args ...any) ([]storedRow, error) {
 				row.ResumeArgv = val
 			case "resume_command":
 				row.ResumeCommand = val
+			case "generated_title":
+				row.GeneratedTitle = val
+			case "generated_summary":
+				row.GeneratedSummary = val
+			case "generated_at":
+				row.GeneratedAt = val
+			case "generated_by":
+				row.GeneratedBy = val
+			case "summary_status":
+				row.SummaryStatus = val
+			case "summary_error":
+				row.SummaryError = val
 			}
 		}
 		out = append(out, row)

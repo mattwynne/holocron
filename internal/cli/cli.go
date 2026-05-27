@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/mattwynne/holocron/internal/index"
 	"github.com/mattwynne/holocron/internal/session"
+	"github.com/mattwynne/holocron/internal/summarizer"
 	"github.com/mattwynne/holocron/internal/tui"
 )
 
@@ -67,6 +69,8 @@ func (a App) Run(args []string) int {
 		err = a.pick(args[1:])
 	case "open":
 		err = a.open(args[1:])
+	case "summarize":
+		err = a.summarize(args[1:])
 	case "service":
 		err = a.service(args[1:])
 	case "daemon":
@@ -94,6 +98,7 @@ Usage:
   holocron today [--json]           List sessions updated in the last 24 hours
   holocron pick [Q]                 Pick and reopen a session in the TUI
   holocron open ID                  Reopen an indexed session
+  holocron summarize [ID|--today|--missing] Generate Holocron titles and summaries
   holocron service COMMAND          Manage the background indexer
   holocron version                  Print version
 
@@ -115,9 +120,6 @@ func (a App) search(args []string) error {
 	}
 	stop := a.startSpinner("Searching sessions")
 	defer stop()
-	if err := a.requireService(); err != nil {
-		return err
-	}
 	results, err := a.store().Search(query, 100)
 	if err != nil {
 		return err
@@ -139,9 +141,6 @@ func (a App) today(args []string) error {
 	}
 	stop := a.startSpinner("Loading recent sessions")
 	defer stop()
-	if err := a.requireService(); err != nil {
-		return err
-	}
 	end := a.now()
 	start := end.Add(-24 * time.Hour)
 	results, err := a.store().UpdatedBetween(start, end, 1000)
@@ -159,10 +158,12 @@ func (a App) today(args []string) error {
 }
 
 func (a App) pick(args []string) error {
-	if err := a.requireService(); err != nil {
-		return err
-	}
-	result, err := tui.Pick(a.store(), strings.Join(args, " "), a.Stdout, a.Stderr)
+	result, err := tui.PickWithStatus(a.store(), strings.Join(args, " "), a.Stdout, a.Stderr, func() string {
+		if a.daemonRunningFast() {
+			return "daemon running"
+		}
+		return "daemon not running; results may be stale"
+	})
 	if err != nil {
 		return err
 	}
@@ -177,6 +178,283 @@ func (a App) open(args []string) error {
 		return errors.New("open requires exactly one session id")
 	}
 	return a.execResult(args[0])
+}
+
+type summarizeOptions struct {
+	ID      string
+	Missing bool
+	Recent  bool
+	Today   bool
+	Limit   int
+	Force   bool
+	DryRun  bool
+	JSON    bool
+	Jobs    int
+}
+
+type summaryOutput struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Summary string `json:"summary"`
+	DryRun  bool   `json:"dry_run"`
+}
+
+type summarizeJob struct {
+	Index int
+	Row   index.SearchResult
+}
+
+type summarizeResult struct {
+	Index  int
+	Output summaryOutput
+	Err    error
+}
+
+func (a App) summarize(args []string) error {
+	opts, err := parseSummarizeArgs(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := summarizer.LoadConfig(a.Home)
+	if err != nil {
+		return err
+	}
+	var results []index.SearchResult
+	if opts.ID != "" {
+		result, err := a.store().Lookup(opts.ID)
+		if err != nil {
+			return err
+		}
+		results = []index.SearchResult{result}
+	} else if opts.Missing {
+		results, err = a.store().MissingGenerated(opts.Limit)
+	} else if opts.Today {
+		end := a.now()
+		start := end.Add(-24 * time.Hour)
+		results, err = a.store().UpdatedBetween(start, end, opts.Limit)
+	} else {
+		results, err = a.store().Recent(opts.Limit)
+	}
+	if err != nil {
+		return err
+	}
+	var todo []index.SearchResult
+	for _, r := range results {
+		if r.GeneratedTitle == "" || opts.Force {
+			todo = append(todo, r)
+		}
+	}
+	updateBar, stop := a.startProgressBar("Summarizing sessions", len(todo))
+	defer stop()
+	outputs := make([]summaryOutput, len(todo))
+	jobs := opts.Jobs
+	if jobs < 1 {
+		jobs = 1
+	}
+	if jobs > len(todo) && len(todo) > 0 {
+		jobs = len(todo)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	jobCh := make(chan summarizeJob)
+	resultCh := make(chan summarizeResult)
+	statusCh := make(chan string, jobs)
+	var wg sync.WaitGroup
+	for worker := 0; worker < jobs; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for job := range jobCh {
+				select {
+				case statusCh <- fmt.Sprintf("worker %d summarizing %s", worker+1, job.Row.ID):
+				default:
+				}
+				resultCh <- a.summarizeOne(ctx, cfg, opts, job)
+			}
+		}(worker)
+	}
+	go func() {
+		defer close(jobCh)
+		for i, r := range todo {
+			select {
+			case <-ctx.Done():
+				return
+			case jobCh <- summarizeJob{Index: i, Row: r}:
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+	completed := 0
+	var firstErr error
+	updateBar(completed, fmt.Sprintf("Starting %d worker(s)", jobs))
+	for completed < len(todo) {
+		select {
+		case status := <-statusCh:
+			updateBar(completed, status)
+		case result, ok := <-resultCh:
+			if !ok {
+				completed = len(todo)
+				break
+			}
+			if result.Err != nil && firstErr == nil {
+				firstErr = result.Err
+				cancel()
+			}
+			if result.Err == nil {
+				outputs[result.Index] = result.Output
+			}
+			completed++
+			updateBar(completed, fmt.Sprintf("Completed %d/%d", completed, len(todo)))
+		case <-time.After(250 * time.Millisecond):
+			updateBar(completed, fmt.Sprintf("Running %d worker(s)", jobs))
+		}
+	}
+	stop()
+	if firstErr != nil {
+		return firstErr
+	}
+	if opts.JSON {
+		enc := json.NewEncoder(a.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(outputs)
+	}
+	for _, out := range outputs {
+		fmt.Fprintf(a.Stdout, "%s\t%s\t%s\n", out.ID, out.Title, out.Summary)
+	}
+	return nil
+}
+
+func (a App) backgroundSummaryWorker(ctx context.Context) {
+	cfg, err := summarizer.LoadConfig(a.Home)
+	if err != nil || !cfg.Background {
+		return
+	}
+	interval := cfg.BackgroundInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	run := func() {
+		rows, err := a.store().PendingSummaries(1)
+		if err != nil || len(rows) == 0 {
+			return
+		}
+		row := rows[0]
+		if err := a.store().SetSummaryStatus(row.ID, "running", ""); err != nil {
+			return
+		}
+		result := a.summarizeOne(ctx, cfg, summarizeOptions{}, summarizeJob{Row: row})
+		if result.Err != nil {
+			_ = a.store().SetSummaryStatus(row.ID, "failed", result.Err.Error())
+			fmt.Fprintln(a.Stderr, "holocron background summary:", result.Err)
+		}
+	}
+	run()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
+func (a App) summarizeOne(ctx context.Context, cfg summarizer.Config, opts summarizeOptions, job summarizeJob) summarizeResult {
+	r := job.Row
+	rec, err := a.store().Get(r.ID)
+	if err != nil {
+		return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
+	}
+	rec, err = session.ParseFile(rec.Tool, filepath.Dir(rec.SourcePath), rec.SourcePath, session.ParseOptions{})
+	if err != nil {
+		return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
+	}
+	rec.ID = r.ID
+	runner := summarizer.Runner{Config: cfg}
+	final, err := runner.Summarize(ctx, rec)
+	if err != nil {
+		return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
+	}
+	if !opts.DryRun {
+		if err := a.store().UpdateGenerated(r.ID, final.Title, final.Summary, strings.Join(cfg.Command, " "), a.now()); err != nil {
+			return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
+		}
+	}
+	return summarizeResult{Index: job.Index, Output: summaryOutput{ID: r.ID, Title: final.Title, Summary: final.Summary, DryRun: opts.DryRun}}
+}
+
+func parseSummarizeArgs(args []string) (summarizeOptions, error) {
+	opts := summarizeOptions{Limit: 20, Jobs: 4}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch a {
+		case "--missing":
+			opts.Missing = true
+		case "--recent":
+			opts.Recent = true
+		case "--today":
+			opts.Today = true
+		case "--force":
+			opts.Force = true
+		case "--dry-run":
+			opts.DryRun = true
+		case "--json":
+			opts.JSON = true
+		case "--limit":
+			i++
+			if i >= len(args) {
+				return opts, errors.New("--limit requires a value")
+			}
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n < 1 {
+				return opts, errors.New("--limit requires a positive integer")
+			}
+			opts.Limit = n
+		case "--jobs":
+			i++
+			if i >= len(args) {
+				return opts, errors.New("--jobs requires a value")
+			}
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n < 1 {
+				return opts, errors.New("--jobs requires a positive integer")
+			}
+			opts.Jobs = n
+		default:
+			if strings.HasPrefix(a, "-") {
+				return opts, fmt.Errorf("unknown summarize flag %s", a)
+			}
+			if opts.ID != "" {
+				return opts, errors.New("summarize accepts at most one session id")
+			}
+			opts.ID = a
+		}
+	}
+	modes := 0
+	if opts.ID != "" {
+		modes++
+	}
+	if opts.Missing {
+		modes++
+	}
+	if opts.Recent {
+		modes++
+	}
+	if opts.Today {
+		modes++
+	}
+	if modes == 0 {
+		return opts, errors.New("summarize requires an ID, --today, --missing, or --recent")
+	}
+	if modes > 1 {
+		return opts, errors.New("summarize accepts only one of ID, --today, --missing, or --recent")
+	}
+	return opts, nil
 }
 
 func (a App) execResult(id string) error {
@@ -331,6 +609,43 @@ func (a App) startProgress(label string) (func(string), func()) {
 	return update, stop
 }
 
+func (a App) startProgressBar(label string, total int) (func(int, string), func()) {
+	if !a.Spinner || !isTerminal(a.Stderr) {
+		return func(int, string) {}, func() {}
+	}
+	done := false
+	render := func(current int, message string) {
+		if total < 1 {
+			fmt.Fprintf(a.Stderr, "\r\033[K%s 0/0 %s", label, message)
+			return
+		}
+		if current < 0 {
+			current = 0
+		}
+		if current > total {
+			current = total
+		}
+		width := 24
+		filled := current * width / total
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+		pct := current * 100 / total
+		fmt.Fprintf(a.Stderr, "\r\033[K%s [%s] %3d%% %d/%d %s", label, bar, pct, current, total, message)
+	}
+	render(0, "")
+	return func(current int, message string) {
+			if done {
+				return
+			}
+			render(current, message)
+		}, func() {
+			if done {
+				return
+			}
+			done = true
+			fmt.Fprint(a.Stderr, "\r\033[K")
+		}
+}
+
 func compactProgressMessage(home, message string) string {
 	return strings.ReplaceAll(message, home, "~")
 }
@@ -369,9 +684,12 @@ func (a App) daemon() error {
 		return err
 	}
 	defer lock()
-	if err := a.fullScan(); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := a.fullScanAndRebuildIndex(); err != nil {
 		fmt.Fprintln(a.Stderr, "holocron daemon:", err)
 	}
+	go a.backgroundSummaryWorker(ctx)
 	watcher, err := newSourceWatcher(session.DefaultSources(a.Home))
 	if err != nil {
 		return err
@@ -398,30 +716,36 @@ func (a App) daemon() error {
 			schedule()
 		case <-debounce:
 			debounce = nil
-			if err := a.fullScan(); err != nil {
+			if err := a.fullScanAndRebuildIndex(); err != nil {
 				fmt.Fprintln(a.Stderr, "holocron daemon:", err)
 			}
 			if err := watcher.Refresh(); err != nil {
 				fmt.Fprintln(a.Stderr, "holocron daemon watcher:", err)
 			}
 		case <-ticker.C:
-			if err := a.fullScan(); err != nil {
+			if err := a.fullScanAndRebuildIndex(); err != nil {
 				fmt.Fprintln(a.Stderr, "holocron daemon:", err)
 			}
 			if err := watcher.Refresh(); err != nil {
 				fmt.Fprintln(a.Stderr, "holocron daemon watcher:", err)
 			}
 		case <-stop:
+			cancel()
 			return nil
 		}
 	}
 }
 
 func (a App) fullScan() error {
+	return a.fullScanAndRebuildIndex()
+}
+
+func (a App) fullScanAndRebuildIndex() error {
 	updateProgress, stopProgress := a.startProgress("Scanning sessions")
 	defer stopProgress()
 	opts := session.ParseOptions{
-		GeminiProjects: session.LoadGeminiProjects(a.Home),
+		GeminiProjects:                   session.LoadGeminiProjects(a.Home),
+		DeleteHolocronSummarizerSessions: true,
 		Warnf: func(format string, args ...any) {
 			fmt.Fprintf(a.Stderr, "holocron parser: "+format+"\n", args...)
 		},
@@ -439,7 +763,10 @@ func (a App) fullScan() error {
 	}
 	records = append(records, registered...)
 	updateProgress("Updating index")
-	return a.store().Rebuild(records)
+	if err := a.store().Rebuild(records); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (a App) registerSession(args []string) error {
@@ -491,6 +818,14 @@ func (a App) registeredSessionRecords(opts session.ParseOptions) ([]session.Reco
 		if err != nil {
 			if opts.Warnf != nil {
 				opts.Warnf("%s: %v", path, err)
+			}
+			continue
+		}
+		if session.IsHolocronSummarizerRecord(rec) {
+			if opts.DeleteHolocronSummarizerSessions {
+				if err := os.Remove(path); err != nil && opts.Warnf != nil {
+					opts.Warnf("%s: remove holocron summarizer session: %v", path, err)
+				}
 			}
 			continue
 		}
@@ -744,10 +1079,31 @@ func (a App) requireService() error {
 	if os.Getenv("HOLOCRON_SKIP_SERVICE_CHECK") == "1" {
 		return nil
 	}
-	if err := launchctl("print", serviceTarget()); err != nil {
+	if !a.daemonRunningFast() {
 		return fmt.Errorf("background service is not running; run `holocron service install` or `holocron service start`")
 	}
 	return nil
+}
+
+func (a App) daemonRunningFast() bool {
+	pid, ok := readDaemonLockPID(filepath.Join(a.Home, ".local", "share", "holocron", "daemon.lock"))
+	return ok && processRunning(pid)
+}
+
+func readDaemonLockPID(path string) (int, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(b))
+	if len(fields) == 0 {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
 }
 
 func (a App) service(args []string) error {
@@ -881,11 +1237,11 @@ export default function (pi: ExtensionAPI) {
 }
 
 func (a App) serviceStatus() error {
-	if err := launchctl("print", serviceTarget()); err != nil {
-		return fmt.Errorf("service is not running")
+	if a.daemonRunningFast() {
+		fmt.Fprintln(a.Stdout, "service is running")
+		return nil
 	}
-	fmt.Fprintln(a.Stdout, "service is running")
-	return nil
+	return fmt.Errorf("service is not running")
 }
 
 func launchctl(args ...string) error {

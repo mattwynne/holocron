@@ -152,6 +152,114 @@ func TestUpdatedBetweenReturnsSessionsAcrossToolsNewestFirst(t *testing.T) {
 	}
 }
 
+func TestGeneratedTitleIsUsedWhenProviderTitleIsFallback(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	rec := session.Record{
+		Tool:          session.ToolCodex,
+		SourcePath:    filepath.Join(t.TempDir(), "codex.jsonl"),
+		SessionID:     "generated123456",
+		Title:         "please help",
+		FirstPrompt:   "please help",
+		CWD:           "/tmp/project",
+		CreatedAt:     time.Date(2026, 5, 13, 10, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 5, 13, 11, 0, 0, 0, time.UTC),
+		ResumeArgv:    []string{"codex", "resume", "generated123456"},
+		ResumeCommand: "cd /tmp/project && exec codex resume generated123456",
+		Transcript:    "please help",
+	}
+	if err := store.Rebuild([]session.Record{rec}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateGenerated("codex:generate", "Generated useful title", "Summary", "test", time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.Recent(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Title != "Generated useful title" {
+		t.Fatalf("results = %#v", results)
+	}
+}
+
+func TestPendingSummaryStatusLifecycle(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	rec := session.Record{
+		Tool:          session.ToolPi,
+		SourcePath:    filepath.Join(t.TempDir(), "pi.jsonl"),
+		SessionID:     "pending123456",
+		Title:         "please title this",
+		FirstPrompt:   "please title this",
+		CWD:           "/tmp/project",
+		CreatedAt:     time.Date(2026, 5, 13, 10, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 5, 13, 11, 0, 0, 0, time.UTC),
+		ResumeArgv:    []string{"pi", "--session", "pi.jsonl"},
+		ResumeCommand: "cd /tmp/project && exec pi --session pi.jsonl",
+	}
+	if err := store.Rebuild([]session.Record{rec}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PendingSummaries(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].SummaryStatus != "pending" {
+		t.Fatalf("pending = %#v", pending)
+	}
+	if err := store.SetSummaryStatus("pi:pending1", "running", ""); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store.PendingSummaries(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].SummaryStatus != "running" {
+		t.Fatalf("running pending = %#v", pending)
+	}
+	if err := store.UpdateGenerated("pi:pending1", "Generated title", "Summary", "test", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store.PendingSummaries(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("done session should not be pending: %#v", pending)
+	}
+}
+
+func TestRebuildPreservesGeneratedMetadata(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	rec := session.Record{
+		Tool:          session.ToolPi,
+		SourcePath:    filepath.Join(t.TempDir(), "pi.jsonl"),
+		SessionID:     "preserve123456",
+		Title:         "(untitled session)",
+		FirstPrompt:   "",
+		CWD:           "/tmp/project",
+		CreatedAt:     time.Date(2026, 5, 13, 10, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 5, 13, 11, 0, 0, 0, time.UTC),
+		ResumeArgv:    []string{"pi", "--session", "pi.jsonl"},
+		ResumeCommand: "cd /tmp/project && exec pi --session pi.jsonl",
+	}
+	if err := store.Rebuild([]session.Record{rec}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateGenerated("pi:preserve", "Preserved generated title", "Summary", "test", time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Rebuild([]session.Record{rec}); err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.Recent(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Title != "Preserved generated title" || results[0].GeneratedSummary != "Summary" {
+		t.Fatalf("generated metadata was not preserved: %#v", results)
+	}
+}
+
 func TestGetReportsInvalidStoredResumeArgv(t *testing.T) {
 	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
 	rec := session.Record{
