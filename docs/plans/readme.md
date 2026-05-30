@@ -7,6 +7,7 @@
 | 004 | [iteration-004.md](iteration-004.md) | Done | Added generated titles/summaries, config-driven summarizer backend, `holocron summarize`, `--today`, progress, parallel jobs, preservation across rebuilds, and cleanup of summarizer backend sessions. |
 | 005 | [iteration-005.md](iteration-005.md) | Planned | Store normalized transcript turns in SQLite and lazily export sessions into Pi-compatible format for `holocron view` and `holocron continue`. |
 | 006 | [iteration-006.md](iteration-006.md) | In progress | Add `holocron ask` for single-turn questions over indexed transcripts using Pi prompt mode. |
+| 007 | [2026-05-30-session-prompt-refactor.md](2026-05-30-session-prompt-refactor.md) | Planned | Refactor `ask` and `summarize` around a shared session-prompt path, with ask cancellation and spinner feedback. |
 
 ## Status key
 
