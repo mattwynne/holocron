@@ -20,6 +20,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/mattwynne/holocron/internal/index"
+	"github.com/mattwynne/holocron/internal/piexport"
 	"github.com/mattwynne/holocron/internal/session"
 	"github.com/mattwynne/holocron/internal/summarizer"
 	"github.com/mattwynne/holocron/internal/tui"
@@ -69,6 +70,12 @@ func (a App) Run(args []string) int {
 		err = a.pick(args[1:])
 	case "open":
 		err = a.open(args[1:])
+	case "view":
+		err = a.view(args[1:])
+	case "continue":
+		err = a.continueSession(args[1:])
+	case "export-pi":
+		err = a.exportPi(args[1:])
 	case "summarize":
 		err = a.summarize(args[1:])
 	case "service":
@@ -97,7 +104,10 @@ Usage:
   holocron search Q [--json]        Search indexed sessions
   holocron today [--json]           List sessions updated in the last 24 hours
   holocron pick [Q]                 Pick and reopen a session in the TUI
-  holocron open ID                  Reopen an indexed session
+  holocron open ID                  Reopen an indexed session in its native tool
+  holocron view ID [--model MODEL]  View an indexed session in Pi
+  holocron continue ID [--model MODEL] Continue an indexed session in Pi
+  holocron export-pi ID             Export an indexed session to Pi JSONL
   holocron summarize [ID|--today|--missing] Generate Holocron titles and summaries
   holocron service COMMAND          Manage the background indexer
   holocron version                  Print version
@@ -178,6 +188,179 @@ func (a App) open(args []string) error {
 		return errors.New("open requires exactly one session id")
 	}
 	return a.execResult(args[0])
+}
+
+func (a App) view(args []string) error {
+	opts, err := parsePiCommandArgs("view", args)
+	if err != nil {
+		return err
+	}
+	path, err := a.ensurePiExport(opts.ID, piexport.KindView)
+	if err != nil {
+		return err
+	}
+	return a.execPiExport(opts.Model, path, opts.ID)
+}
+
+func (a App) continueSession(args []string) error {
+	opts, err := parsePiCommandArgs("continue", args)
+	if err != nil {
+		return err
+	}
+	if _, err := exec.LookPath("pi"); err != nil {
+		return errors.New("pi executable not found in PATH")
+	}
+	path, err := a.ensurePiExport(opts.ID, piexport.KindContinue)
+	if err != nil {
+		return err
+	}
+	return a.execPiExport(opts.Model, path, opts.ID)
+}
+
+func (a App) exportPi(args []string) error {
+	opts, err := parseExportPiArgs(args)
+	if err != nil {
+		return err
+	}
+	path, err := a.ensurePiExport(opts.ID, opts.Kind)
+	if err != nil {
+		return err
+	}
+	if opts.JSON {
+		return json.NewEncoder(a.Stdout).Encode(map[string]string{"id": opts.ID, "kind": string(opts.Kind), "path": path})
+	}
+	fmt.Fprintln(a.Stdout, path)
+	return nil
+}
+
+type piCommandOptions struct{ ID, Model string }
+type exportPiOptions struct {
+	ID   string
+	Kind piexport.Kind
+	JSON bool
+}
+
+func parsePiCommandArgs(command string, args []string) (piCommandOptions, error) {
+	var opts piCommandOptions
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--model":
+			i++
+			if i >= len(args) {
+				return opts, errors.New("--model requires a value")
+			}
+			opts.Model = args[i]
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return opts, fmt.Errorf("unknown %s flag %s", command, args[i])
+			}
+			if opts.ID != "" {
+				return opts, fmt.Errorf("%s accepts exactly one session id", command)
+			}
+			opts.ID = args[i]
+		}
+	}
+	if opts.ID == "" {
+		return opts, fmt.Errorf("%s requires exactly one session id", command)
+	}
+	return opts, nil
+}
+
+func parseExportPiArgs(args []string) (exportPiOptions, error) {
+	opts := exportPiOptions{Kind: piexport.KindView}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--kind":
+			i++
+			if i >= len(args) {
+				return opts, errors.New("--kind requires a value")
+			}
+			switch args[i] {
+			case "view":
+				opts.Kind = piexport.KindView
+			case "continue":
+				opts.Kind = piexport.KindContinue
+			default:
+				return opts, errors.New("--kind must be view or continue")
+			}
+		case "--json":
+			opts.JSON = true
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return opts, fmt.Errorf("unknown export-pi flag %s", args[i])
+			}
+			if opts.ID != "" {
+				return opts, errors.New("export-pi accepts exactly one session id")
+			}
+			opts.ID = args[i]
+		}
+	}
+	if opts.ID == "" {
+		return opts, errors.New("export-pi requires exactly one session id")
+	}
+	return opts, nil
+}
+
+func (a App) ensurePiExport(id string, kind piexport.Kind) (string, error) {
+	tr, err := a.store().Transcript(id)
+	if err != nil {
+		if index.IsMissing(err) {
+			return "", fmt.Errorf("session %s has no normalized transcript; wait for the daemon to re-index it or restart the service", id)
+		}
+		return "", err
+	}
+	var path string
+	if kind == piexport.KindView {
+		path = piexport.ViewPath(a.Home, id)
+		oldPath, oldSource, oldFile, err := a.store().ViewExport(id)
+		if err == nil && oldPath == path && oldSource == tr.Hash {
+			if currentHash, hashErr := piexport.FileHash(path); hashErr == nil {
+				if oldFile != "" && currentHash != oldFile {
+					return "", errors.New("view export was modified; use holocron continue to preserve follow-up work or delete the cached export to regenerate it")
+				}
+				return path, nil
+			}
+		}
+		if oldPath == path && oldFile != "" {
+			if currentHash, hashErr := piexport.FileHash(path); hashErr == nil && currentHash != oldFile {
+				return "", errors.New("view export was modified; use holocron continue to preserve follow-up work or delete the cached export to regenerate it")
+			}
+		}
+	} else {
+		path, err = piexport.NewContinuePath(a.Home, id, a.now())
+		if err != nil {
+			return "", err
+		}
+	}
+	fileHash, err := piexport.Write(path, tr, kind, string(kind))
+	if err != nil {
+		return "", err
+	}
+	if err := a.store().ExportRecord(id, string(kind), path, tr.Hash, fileHash, a.now()); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (a App) execPiExport(model, path, id string) error {
+	tr, err := a.store().Transcript(id)
+	if err != nil {
+		return err
+	}
+	if tr.CWD != "" {
+		if err := os.Chdir(tr.CWD); err != nil {
+			return err
+		}
+	}
+	argv := []string{"pi", "--session", path}
+	if model != "" {
+		argv = append(argv, "--model", model)
+	}
+	bin, err := exec.LookPath("pi")
+	if err != nil {
+		return errors.New("pi executable not found in PATH")
+	}
+	return a.Exec(bin, argv, os.Environ())
 }
 
 type summarizeOptions struct {
@@ -327,7 +510,7 @@ func (a App) summarize(args []string) error {
 	return nil
 }
 
-func (a App) backgroundSummaryWorker(ctx context.Context) {
+func (a App) backgroundSummaryWorker(ctx context.Context, writeMu *sync.Mutex) {
 	cfg, err := summarizer.LoadConfig(a.Home)
 	if err != nil || !cfg.Background {
 		return
@@ -337,6 +520,10 @@ func (a App) backgroundSummaryWorker(ctx context.Context) {
 		interval = 30 * time.Second
 	}
 	run := func() {
+		if writeMu != nil {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+		}
 		rows, err := a.store().PendingSummaries(1)
 		if err != nil || len(rows) == 0 {
 			return
@@ -718,10 +905,19 @@ func (a App) daemon() error {
 	defer lock()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := a.fullScanAndRebuildIndex(); err != nil {
-		fmt.Fprintln(a.Stderr, "holocron daemon:", err)
+	lastScan := time.Time{}
+	var writeMu sync.Mutex
+	runScan := func() {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if err := a.fullScanAndRebuildIndex(); err != nil {
+			fmt.Fprintln(a.Stderr, "holocron daemon:", err)
+			return
+		}
+		lastScan = time.Now()
 	}
-	go a.backgroundSummaryWorker(ctx)
+	runScan()
+	go a.backgroundSummaryWorker(ctx, &writeMu)
 	watcher, err := newSourceWatcher(session.DefaultSources(a.Home))
 	if err != nil {
 		return err
@@ -735,7 +931,11 @@ func (a App) daemon() error {
 		if debounceTimer != nil {
 			debounceTimer.Stop()
 		}
-		debounceTimer = time.NewTimer(time.Second)
+		delay := time.Second
+		if since := time.Since(lastScan); !lastScan.IsZero() && since < 30*time.Second {
+			delay = 30*time.Second - since
+		}
+		debounceTimer = time.NewTimer(delay)
 		debounce = debounceTimer.C
 	}
 	stop := make(chan os.Signal, 1)
@@ -748,16 +948,12 @@ func (a App) daemon() error {
 			schedule()
 		case <-debounce:
 			debounce = nil
-			if err := a.fullScanAndRebuildIndex(); err != nil {
-				fmt.Fprintln(a.Stderr, "holocron daemon:", err)
-			}
+			runScan()
 			if err := watcher.Refresh(); err != nil {
 				fmt.Fprintln(a.Stderr, "holocron daemon watcher:", err)
 			}
 		case <-ticker.C:
-			if err := a.fullScanAndRebuildIndex(); err != nil {
-				fmt.Fprintln(a.Stderr, "holocron daemon:", err)
-			}
+			runScan()
 			if err := watcher.Refresh(); err != nil {
 				fmt.Fprintln(a.Stderr, "holocron daemon watcher:", err)
 			}
@@ -1322,6 +1518,11 @@ func plist(home, exe string) string {
     <string>%s</string>
     <string>daemon</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>%s</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -1332,7 +1533,37 @@ func plist(home, exe string) string {
   <string>%s</string>
 </dict>
 </plist>
-`, serviceLabel, xmlEscape(exe), xmlEscape(filepath.Join(logDir, "daemon.log")), xmlEscape(filepath.Join(logDir, "daemon.err.log")))
+`, serviceLabel, xmlEscape(exe), xmlEscape(servicePath(home)), xmlEscape(filepath.Join(logDir, "daemon.log")), xmlEscape(filepath.Join(logDir, "daemon.err.log")))
+}
+
+func servicePath(home string) string {
+	var parts []string
+	seen := map[string]bool{}
+	add := func(path string) {
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		parts = append(parts, path)
+	}
+	for _, path := range filepath.SplitList(os.Getenv("PATH")) {
+		add(path)
+	}
+	for _, path := range []string{
+		filepath.Join(home, ".pi", "agent", "bin"),
+		filepath.Join(home, ".asdf", "shims"),
+		filepath.Join(home, ".local", "bin"),
+		"/opt/homebrew/bin",
+		"/opt/homebrew/sbin",
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
+	} {
+		add(path)
+	}
+	return strings.Join(parts, ":")
 }
 
 func xmlEscape(s string) string {

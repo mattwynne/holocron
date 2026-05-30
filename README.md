@@ -62,10 +62,18 @@ holocron pick
 holocron pick "auth redirect"
 ```
 
-Open a result by ID:
+Open a result by ID in its native tool:
 
 ```sh
 holocron open pi:019e31be
+```
+
+View or continue a normalized Claude session in Pi:
+
+```sh
+holocron view cd:019e31be
+holocron continue cd:019e31be --model anthropic/claude-sonnet-4-5
+holocron export-pi cd:019e31be
 ```
 
 Generate Holocron-native titles and summaries:

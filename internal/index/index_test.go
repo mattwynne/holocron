@@ -248,8 +248,18 @@ func TestPendingSummaryStatusLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 || pending[0].SummaryStatus != "running" {
-		t.Fatalf("running pending = %#v", pending)
+	if len(pending) != 0 {
+		t.Fatalf("running session should not be retried in background: %#v", pending)
+	}
+	if err := store.SetSummaryStatus("pi:pending1", "failed", "pi not found"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store.PendingSummaries(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("failed session should not be retried in background: %#v", pending)
 	}
 	if err := store.UpdateGenerated("pi:pending1", "Generated title", "Summary", "test", time.Now()); err != nil {
 		t.Fatal(err)

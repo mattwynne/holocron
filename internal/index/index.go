@@ -11,11 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattwynne/holocron/internal/piexport"
 	"github.com/mattwynne/holocron/internal/session"
+	"github.com/mattwynne/holocron/internal/transcript"
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 type Store struct {
 	Path string
@@ -61,6 +63,9 @@ type storedRow struct {
 	GeneratedBy      string
 	SummaryStatus    string
 	SummaryError     string
+	NormalizedHash   string
+	NormalizedAt     string
+	TurnCount        int
 }
 
 type dbtx interface {
@@ -97,6 +102,7 @@ func (s Store) Rebuild(records []session.Record) error {
 	if err != nil {
 		return err
 	}
+	normalized := normalizeRecords(records)
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -105,6 +111,9 @@ func (s Store) Rebuild(records []session.Record) error {
 	defer rollbackUnlessCommitted(tx, &err)
 
 	if _, err = tx.Exec("DELETE FROM sessions_fts"); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM session_turns"); err != nil {
 		return err
 	}
 	if _, err = tx.Exec("DELETE FROM sessions"); err != nil {
@@ -120,6 +129,11 @@ func (s Store) Rebuild(records []session.Record) error {
 			}
 		} else if err = upsertSession(tx, rec); err != nil {
 			return err
+		}
+		if tr, ok := normalized[rec.ID]; ok {
+			if err = replaceTurns(tx, tr); err != nil {
+				return err
+			}
 		}
 	}
 	err = tx.Commit()
@@ -138,6 +152,7 @@ func (s Store) Upsert(records []session.Record) error {
 		return err
 	}
 	records = session.AssignStableIDs(records, existing)
+	normalized := normalizeRecords(records)
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -151,6 +166,11 @@ func (s Store) Upsert(records []session.Record) error {
 		}
 		if err = upsertSession(tx, rec); err != nil {
 			return err
+		}
+		if tr, ok := normalized[rec.ID]; ok {
+			if err = replaceTurns(tx, tr); err != nil {
+				return err
+			}
 		}
 	}
 	err = tx.Commit()
@@ -382,8 +402,36 @@ CREATE TABLE IF NOT EXISTS sessions (
   generated_at TEXT NOT NULL DEFAULT '',
   generated_by TEXT NOT NULL DEFAULT '',
   summary_status TEXT NOT NULL DEFAULT 'pending',
-  summary_error TEXT NOT NULL DEFAULT ''
+  summary_error TEXT NOT NULL DEFAULT '',
+  normalized_hash TEXT NOT NULL DEFAULT '',
+  normalized_at TEXT NOT NULL DEFAULT '',
+  turn_count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS session_turns (
+  holocron_id TEXT NOT NULL,
+  idx INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  text TEXT NOT NULL,
+  tool_name TEXT NOT NULL DEFAULT '',
+  tool_input TEXT NOT NULL DEFAULT '',
+  tool_output TEXT NOT NULL DEFAULT '',
+  is_error INTEGER NOT NULL DEFAULT 0,
+  timestamp TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (holocron_id, idx)
+);
+CREATE TABLE IF NOT EXISTS session_exports (
+  holocron_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  path TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  file_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (holocron_id, kind, path)
+);
+CREATE INDEX IF NOT EXISTS idx_session_exports_holocron_id ON session_exports(holocron_id);
+CREATE INDEX IF NOT EXISTS idx_session_exports_kind_updated ON session_exports(kind, updated_at);
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(id UNINDEXED, title, first_prompt, cwd, transcript_text);
 `); err != nil {
 		return fmt.Errorf("initialize sqlite schema, including FTS5 table: %w", err)
@@ -400,6 +448,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(id UNINDEXED, title, 
 	}
 	if version < 4 {
 		if err := migrateLegacyIDPrefixes(db); err != nil {
+			return err
+		}
+	}
+	if version < 5 {
+		if err := addNormalizedTables(db); err != nil {
 			return err
 		}
 	}
@@ -436,6 +489,44 @@ func addSummaryStatusColumns(db *sql.DB) error {
 		}
 	}
 	_, err := db.Exec(`UPDATE sessions SET summary_status = 'done' WHERE generated_title <> '' OR generated_summary <> ''`)
+	return err
+}
+
+func addNormalizedTables(db *sql.DB) error {
+	for _, stmt := range []string{
+		`ALTER TABLE sessions ADD COLUMN normalized_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN normalized_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN turn_count INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") && !strings.Contains(err.Error(), "no such table") {
+			return fmt.Errorf("migrate normalized metadata: %w", err)
+		}
+	}
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS session_turns (
+  holocron_id TEXT NOT NULL,
+  idx INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  text TEXT NOT NULL,
+  tool_name TEXT NOT NULL DEFAULT '',
+  tool_input TEXT NOT NULL DEFAULT '',
+  tool_output TEXT NOT NULL DEFAULT '',
+  is_error INTEGER NOT NULL DEFAULT 0,
+  timestamp TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (holocron_id, idx)
+);
+CREATE TABLE IF NOT EXISTS session_exports (
+  holocron_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  path TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  file_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (holocron_id, kind, path)
+);
+CREATE INDEX IF NOT EXISTS idx_session_exports_holocron_id ON session_exports(holocron_id);
+CREATE INDEX IF NOT EXISTS idx_session_exports_kind_updated ON session_exports(kind, updated_at);`)
 	return err
 }
 
@@ -507,8 +598,8 @@ func upsertSessionWithGenerated(db dbtx, rec session.Record, existing storedRow)
 		}
 	}
 	display := displayTitle(storedRow{Title: rec.Title, FirstPrompt: rec.FirstPrompt, GeneratedTitle: existing.GeneratedTitle})
-	if _, err := db.Exec(`INSERT OR REPLACE INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.ID, string(rec.Tool), rec.SourcePath, rec.SessionID, rec.Title, rec.FirstPrompt, rec.CWD, created, updated, rec.FileSizeBytes, rec.MessageCount, string(argv), rec.ResumeCommand, existing.GeneratedTitle, existing.GeneratedSummary, existing.GeneratedAt, existing.GeneratedBy, existing.SummaryStatus, existing.SummaryError); err != nil {
+	if _, err := db.Exec(`INSERT OR REPLACE INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error, normalized_hash, normalized_at, turn_count)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.ID, string(rec.Tool), rec.SourcePath, rec.SessionID, rec.Title, rec.FirstPrompt, rec.CWD, created, updated, rec.FileSizeBytes, rec.MessageCount, string(argv), rec.ResumeCommand, existing.GeneratedTitle, existing.GeneratedSummary, existing.GeneratedAt, existing.GeneratedBy, existing.SummaryStatus, existing.SummaryError, existing.NormalizedHash, existing.NormalizedAt, existing.TurnCount); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`DELETE FROM sessions_fts WHERE id = ?`, rec.ID); err != nil {
@@ -542,7 +633,7 @@ func (s Store) MissingGenerated(limit int) ([]SearchResult, error) {
 }
 
 func (s Store) PendingSummaries(limit int) ([]SearchResult, error) {
-	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' AND NOT (`+providerTitleSQL()+`) AND summary_status IN ('pending', 'failed', 'running') ORDER BY updated_at DESC LIMIT ?`, limit)
+	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' AND NOT (`+providerTitleSQL()+`) AND summary_status = 'pending' ORDER BY updated_at DESC LIMIT ?`, limit)
 }
 
 func (s Store) SetSummaryStatus(id, status, message string) error {
@@ -591,11 +682,105 @@ func markAlreadyNamedSessionsDone(db *sql.DB) error {
 }
 
 func deleteID(db dbtx, id string) error {
+	if _, err := db.Exec(`DELETE FROM session_turns WHERE holocron_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`DELETE FROM session_exports WHERE holocron_id = ?`, id); err != nil {
+		return err
+	}
 	if _, err := db.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
 		return err
 	}
 	_, err := db.Exec(`DELETE FROM sessions_fts WHERE id = ?`, id)
 	return err
+}
+
+func normalizeRecords(records []session.Record) map[string]transcript.Transcript {
+	out := map[string]transcript.Transcript{}
+	for _, rec := range records {
+		tr, err := transcript.ParseFile(rec)
+		if err == nil && len(tr.Turns) > 0 {
+			out[rec.ID] = tr
+		}
+	}
+	return out
+}
+
+func replaceTurns(db dbtx, tr transcript.Transcript) error {
+	if _, err := db.Exec(`DELETE FROM session_turns WHERE holocron_id = ?`, tr.HolocronID); err != nil {
+		return err
+	}
+	for i, turn := range tr.Turns {
+		ts := ""
+		if !turn.Timestamp.IsZero() {
+			ts = turn.Timestamp.UTC().Format(time.RFC3339Nano)
+		}
+		isError := 0
+		if turn.IsError {
+			isError = 1
+		}
+		if _, err := db.Exec(`INSERT INTO session_turns(holocron_id, idx, role, text, tool_name, tool_input, tool_output, is_error, timestamp, metadata_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, tr.HolocronID, i, string(turn.Role), turn.Text, turn.ToolName, turn.ToolInput, turn.ToolOutput, isError, ts, turn.MetadataJSON); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(`UPDATE sessions SET normalized_hash = ?, normalized_at = ?, turn_count = ? WHERE id = ?`, tr.Hash, time.Now().UTC().Format(time.RFC3339), len(tr.Turns), tr.HolocronID)
+	return err
+}
+
+func (s Store) Transcript(id string) (transcript.Transcript, error) {
+	rec, err := s.Get(id)
+	if err != nil {
+		return transcript.Transcript{}, err
+	}
+	db, err := s.openReadOnly()
+	if err != nil {
+		return transcript.Transcript{}, err
+	}
+	defer db.Close()
+	tr := transcript.Transcript{HolocronID: rec.ID, ProviderSessionID: rec.SessionID, Tool: rec.Tool, SourcePath: rec.SourcePath, CWD: rec.CWD, CreatedAt: rec.CreatedAt, UpdatedAt: rec.UpdatedAt}
+	if err := db.QueryRow(`SELECT normalized_hash FROM sessions WHERE id = ?`, id).Scan(&tr.Hash); err != nil {
+		return transcript.Transcript{}, err
+	}
+	rows, err := db.Query(`SELECT role, text, tool_name, tool_input, tool_output, is_error, timestamp, metadata_json FROM session_turns WHERE holocron_id = ? ORDER BY idx`, id)
+	if err != nil {
+		return transcript.Transcript{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var role, text, toolName, toolInput, toolOutput, ts, meta string
+		var isError int
+		if err := rows.Scan(&role, &text, &toolName, &toolInput, &toolOutput, &isError, &ts, &meta); err != nil {
+			return transcript.Transcript{}, err
+		}
+		tr.Turns = append(tr.Turns, transcript.Turn{Role: transcript.Role(role), Text: text, ToolName: toolName, ToolInput: toolInput, ToolOutput: toolOutput, IsError: isError != 0, Timestamp: parseTime(ts), MetadataJSON: meta})
+	}
+	if err := rows.Err(); err != nil {
+		return transcript.Transcript{}, err
+	}
+	if len(tr.Turns) == 0 {
+		return transcript.Transcript{}, os.ErrNotExist
+	}
+	return tr, nil
+}
+
+func (s Store) ExportRecord(id, kind, path, sourceHash, fileHash string, now time.Time) error {
+	db, err := s.openInitialized()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(`INSERT OR REPLACE INTO session_exports(holocron_id, kind, path, source_hash, file_hash, created_at, updated_at) VALUES(?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM session_exports WHERE holocron_id = ? AND kind = ? AND path = ?), ?), ?)`, id, kind, path, sourceHash, fileHash, id, kind, path, now.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s Store) ViewExport(id string) (path, sourceHash, fileHash string, err error) {
+	db, err := s.openReadOnly()
+	if err != nil {
+		return "", "", "", err
+	}
+	defer db.Close()
+	err = db.QueryRow(`SELECT path, source_hash, file_hash FROM session_exports WHERE holocron_id = ? AND kind = ? ORDER BY updated_at DESC LIMIT 1`, id, string(piexport.KindView)).Scan(&path, &sourceHash, &fileHash)
+	return path, sourceHash, fileHash, err
 }
 
 func queryStoredRows(db dbtx, query string, args ...any) ([]storedRow, error) {

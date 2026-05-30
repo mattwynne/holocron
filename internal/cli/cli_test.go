@@ -49,6 +49,17 @@ func TestSearchJSONCommand(t *testing.T) {
 	}
 }
 
+func TestServicePlistIncludesPathForPiSummarizer(t *testing.T) {
+	home := "/Users/matt"
+	t.Setenv("PATH", "/custom/pi/bin:/usr/bin")
+	got := plist(home, "/tmp/holocron")
+	for _, want := range []string{"<key>EnvironmentVariables</key>", "<key>PATH</key>", "/custom/pi/bin", "/Users/matt/.asdf/shims", "/Users/matt/.local/bin"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("plist missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestSearchTableShowsFolder(t *testing.T) {
 	home := t.TempDir()
 	srcRoot := filepath.Join(home, ".codex", "sessions", "2026")
@@ -308,6 +319,44 @@ func TestSummarizeTodayOnlyUsesLast24Hours(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"id": "cx:today123"`) || strings.Contains(out.String(), "old123") {
 		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestExportPiCreatesViewExportFromClaudeTranscript(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	srcRoot := filepath.Join(home, ".claude", "projects", "-tmp-project")
+	for _, dir := range []string{project, srcRoot} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(srcRoot, "claude.jsonl"), strings.Join([]string{
+		`{"sessionId":"abcdef1234567890","cwd":` + quote(project) + `,"timestamp":"2026-05-27T10:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix export"}]}}`,
+		`{"sessionId":"abcdef1234567890","cwd":` + quote(project) + `,"timestamp":"2026-05-27T10:00:01Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done"}]}}`,
+	}, "\n")+"\n")
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false, Now: func() time.Time { return time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC) }}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	app.Stdout = &out
+	if code := app.Run([]string{"export-pi", "cd:abcdef12"}); code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	path := strings.TrimSpace(out.String())
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"type":"session"`) || !strings.Contains(string(b), "Fix export") || !strings.Contains(string(b), "Done") {
+		t.Fatalf("unexpected export: %s", string(b))
+	}
+
+	writeFile(t, path, string(b)+"modified\n")
+	out.Reset()
+	if code := app.Run([]string{"export-pi", "cd:abcdef12"}); code == 0 || !strings.Contains(app.Stderr.(*bytes.Buffer).String(), "view export was modified") {
+		t.Fatalf("expected modified export error, code=%d stderr=%s", code, app.Stderr)
 	}
 }
 
