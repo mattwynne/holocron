@@ -145,6 +145,12 @@ Daemon behaviour:
 
 `holocron daemon` may exist as an internal/hidden command used by launchd.
 
+### Summary job leases
+
+Generated-summary jobs use `pending`, `running`, `done`, and `failed` states. When the daemon claims a pending summary, it records a `summary_started_at` lease timestamp and increments an attempt count. If a daemon exits or loses the database before finalising a job, a later daemon run resets stale `running` jobs back to `pending` so they are not stranded forever.
+
+Model and Pi execution errors mark the row `failed` with `summary_error`. Failed rows are visible in summary queue health and can be retried manually with `holocron summarize ID --force`.
+
 ### Daemon lock and health
 
 The lock file contains the daemon PID and start time. On daemon startup, if the lock exists but the PID is not running, remove the stale lock and continue. If the PID is running, exit with a clear error.

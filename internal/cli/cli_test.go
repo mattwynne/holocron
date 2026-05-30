@@ -13,6 +13,7 @@ import (
 
 	"github.com/mattwynne/holocron/internal/index"
 	"github.com/mattwynne/holocron/internal/session"
+	"github.com/mattwynne/holocron/internal/summarizer"
 )
 
 func TestSearchJSONCommand(t *testing.T) {
@@ -281,6 +282,89 @@ func TestSummarizeSkipsExistingGeneratedMetadataWithoutForce(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("model command should not have been called, stat err=%v", err)
+	}
+}
+
+func TestBackgroundSummaryMarksModelErrorFailed(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	srcRoot := filepath.Join(home, ".codex", "sessions")
+	cfgDir := filepath.Join(home, ".config", "holocron")
+	for _, dir := range []string{project, srcRoot, cfgDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := filepath.Join(home, "model")
+	writeFile(t, script, "#!/bin/sh\necho model failed >&2\nexit 42\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(cfgDir, "config.toml"), "[pi]\nexecutable = "+quote(script)+"\n")
+	writeFile(t, filepath.Join(srcRoot, "codex.jsonl"), strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"bgfail123456","timestamp":"2026-05-13T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Needs a title"}`,
+	}, "\n")+"\n")
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false, Now: func() time.Time {
+		return time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+	}}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := summarizer.LoadConfig(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.runOneBackgroundSummary(context.Background(), cfg, nil); err == nil {
+		t.Fatal("expected background summary error")
+	}
+	row, err := app.store().Lookup("cx:bgfail12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.SummaryStatus != "failed" || row.SummaryError == "" {
+		t.Fatalf("row = %#v", row)
+	}
+}
+
+func TestSummarizeForceRetriesFailedSummary(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	srcRoot := filepath.Join(home, ".codex", "sessions")
+	cfgDir := filepath.Join(home, ".config", "holocron")
+	for _, dir := range []string{project, srcRoot, cfgDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := filepath.Join(home, "model")
+	writeFile(t, script, "#!/bin/sh\necho '{\"title\":\"Retried title\",\"summary\":\"Retried a failed summary.\",\"status\":\"implemented\",\"key_files\":[],\"confidence\":\"high\"}'\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(cfgDir, "config.toml"), "[pi]\nexecutable = "+quote(script)+"\n")
+	writeFile(t, filepath.Join(srcRoot, "codex.jsonl"), strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"retry123456","timestamp":"2026-05-13T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Needs a retry"}`,
+	}, "\n")+"\n")
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store().SetSummaryStatus("cx:retry123", "failed", "old error"); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	app.Stdout = &out
+	if code := app.Run([]string{"summarize", "cx:retry123", "--force", "--json"}); code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+	}
+	row, err := app.store().Lookup("cx:retry123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.SummaryStatus != "done" || row.GeneratedTitle != "Retried title" {
+		t.Fatalf("row = %#v", row)
 	}
 }
 

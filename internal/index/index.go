@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 type Store struct {
 	Path string
@@ -63,6 +63,8 @@ type storedRow struct {
 	GeneratedBy      string
 	SummaryStatus    string
 	SummaryError     string
+	SummaryStartedAt string
+	SummaryAttempts  int
 	NormalizedHash   string
 	NormalizedAt     string
 	TurnCount        int
@@ -329,6 +331,11 @@ func (s Store) readRows(query string, args ...any) ([]SearchResult, error) {
 	return out, nil
 }
 
+func searchResult(row storedRow) SearchResult {
+	argv, _ := decodeArgv(row.ResumeArgv, row.ID)
+	return SearchResult{ID: row.ID, Tool: row.Tool, Title: displayTitle(row), Folder: FolderName(row.CWD), CWD: row.CWD, UpdatedAt: row.UpdatedAt, Size: HumanSize(row.FileSizeBytes), FileSizeBytes: row.FileSizeBytes, MessageCount: row.MessageCount, ResumeArgv: argv, ResumeCommand: row.ResumeCommand, GeneratedTitle: row.GeneratedTitle, GeneratedSummary: row.GeneratedSummary, GeneratedAt: row.GeneratedAt, GeneratedBy: row.GeneratedBy, SummaryStatus: row.SummaryStatus, SummaryError: row.SummaryError}
+}
+
 func (s Store) openReadOnly() (*sql.DB, error) {
 	if _, err := os.Stat(s.Path); err != nil {
 		return nil, err
@@ -403,6 +410,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   generated_by TEXT NOT NULL DEFAULT '',
   summary_status TEXT NOT NULL DEFAULT 'pending',
   summary_error TEXT NOT NULL DEFAULT '',
+  summary_started_at TEXT NOT NULL DEFAULT '',
+  summary_attempts INTEGER NOT NULL DEFAULT 0,
   normalized_hash TEXT NOT NULL DEFAULT '',
   normalized_at TEXT NOT NULL DEFAULT '',
   turn_count INTEGER NOT NULL DEFAULT 0
@@ -456,6 +465,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(id UNINDEXED, title, 
 			return err
 		}
 	}
+	if version < 6 {
+		if err := addSummaryLeaseColumns(db); err != nil {
+			return err
+		}
+	}
 	if err := markAlreadyNamedSessionsDone(db); err != nil {
 		return err
 	}
@@ -490,6 +504,18 @@ func addSummaryStatusColumns(db *sql.DB) error {
 	}
 	_, err := db.Exec(`UPDATE sessions SET summary_status = 'done' WHERE generated_title <> '' OR generated_summary <> ''`)
 	return err
+}
+
+func addSummaryLeaseColumns(db *sql.DB) error {
+	for _, stmt := range []string{
+		`ALTER TABLE sessions ADD COLUMN summary_started_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN summary_attempts INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") && !strings.Contains(err.Error(), "no such table") {
+			return fmt.Errorf("migrate summary leases: %w", err)
+		}
+	}
+	return nil
 }
 
 func addNormalizedTables(db *sql.DB) error {
@@ -565,7 +591,7 @@ func insertAssignedID(db dbtx, rec session.Record) error {
 }
 
 func generatedByID(db dbtx) (map[string]storedRow, error) {
-	rows, err := queryStoredRows(db, `SELECT id, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title <> '' OR generated_summary <> '' OR summary_status <> 'pending' OR summary_error <> ''`)
+	rows, err := queryStoredRows(db, `SELECT id, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error, summary_started_at, summary_attempts FROM sessions WHERE generated_title <> '' OR generated_summary <> '' OR summary_status <> 'pending' OR summary_error <> '' OR summary_started_at <> '' OR summary_attempts <> 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -577,7 +603,7 @@ func generatedByID(db dbtx) (map[string]storedRow, error) {
 }
 
 func upsertSession(db dbtx, rec session.Record) error {
-	if rows, err := queryStoredRows(db, `SELECT generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE id = ?`, rec.ID); err == nil && len(rows) > 0 {
+	if rows, err := queryStoredRows(db, `SELECT generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error, summary_started_at, summary_attempts FROM sessions WHERE id = ?`, rec.ID); err == nil && len(rows) > 0 {
 		return upsertSessionWithGenerated(db, rec, rows[0])
 	}
 	return upsertSessionWithGenerated(db, rec, storedRow{})
@@ -598,8 +624,8 @@ func upsertSessionWithGenerated(db dbtx, rec session.Record, existing storedRow)
 		}
 	}
 	display := displayTitle(storedRow{Title: rec.Title, FirstPrompt: rec.FirstPrompt, GeneratedTitle: existing.GeneratedTitle})
-	if _, err := db.Exec(`INSERT OR REPLACE INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error, normalized_hash, normalized_at, turn_count)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.ID, string(rec.Tool), rec.SourcePath, rec.SessionID, rec.Title, rec.FirstPrompt, rec.CWD, created, updated, rec.FileSizeBytes, rec.MessageCount, string(argv), rec.ResumeCommand, existing.GeneratedTitle, existing.GeneratedSummary, existing.GeneratedAt, existing.GeneratedBy, existing.SummaryStatus, existing.SummaryError, existing.NormalizedHash, existing.NormalizedAt, existing.TurnCount); err != nil {
+	if _, err := db.Exec(`INSERT OR REPLACE INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error, summary_started_at, summary_attempts, normalized_hash, normalized_at, turn_count)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.ID, string(rec.Tool), rec.SourcePath, rec.SessionID, rec.Title, rec.FirstPrompt, rec.CWD, created, updated, rec.FileSizeBytes, rec.MessageCount, string(argv), rec.ResumeCommand, existing.GeneratedTitle, existing.GeneratedSummary, existing.GeneratedAt, existing.GeneratedBy, existing.SummaryStatus, existing.SummaryError, existing.SummaryStartedAt, existing.SummaryAttempts, existing.NormalizedHash, existing.NormalizedAt, existing.TurnCount); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`DELETE FROM sessions_fts WHERE id = ?`, rec.ID); err != nil {
@@ -615,7 +641,7 @@ func (s Store) UpdateGenerated(id, title, summary, generatedBy string, at time.T
 		return err
 	}
 	defer db.Close()
-	res, err := db.Exec(`UPDATE sessions SET generated_title = ?, generated_summary = ?, generated_at = ?, generated_by = ?, summary_status = 'done', summary_error = '' WHERE id = ?`, title, summary, at.UTC().Format(time.RFC3339), generatedBy, id)
+	res, err := db.Exec(`UPDATE sessions SET generated_title = ?, generated_summary = ?, generated_at = ?, generated_by = ?, summary_status = 'done', summary_error = '', summary_started_at = '' WHERE id = ?`, title, summary, at.UTC().Format(time.RFC3339), generatedBy, id)
 	if err != nil {
 		return err
 	}
@@ -636,13 +662,97 @@ func (s Store) PendingSummaries(limit int) ([]SearchResult, error) {
 	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' AND NOT (`+providerTitleSQL()+`) AND summary_status = 'pending' ORDER BY updated_at DESC LIMIT ?`, limit)
 }
 
+func (s Store) ClaimPendingSummary(now time.Time) (SearchResult, bool, error) {
+	db, err := s.openInitialized()
+	if err != nil {
+		return SearchResult{}, false, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return SearchResult{}, false, err
+	}
+	defer tx.Rollback()
+	rows, err := queryStoredRows(tx, `SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error FROM sessions WHERE generated_title = '' AND NOT (`+providerTitleSQL()+`) AND summary_status = 'pending' ORDER BY updated_at DESC LIMIT 1`)
+	if err != nil {
+		return SearchResult{}, false, err
+	}
+	if len(rows) == 0 {
+		if err := tx.Commit(); err != nil {
+			return SearchResult{}, false, err
+		}
+		return SearchResult{}, false, nil
+	}
+	row := rows[0]
+	res, err := tx.Exec(`UPDATE sessions SET summary_status = 'running', summary_error = '', summary_started_at = ?, summary_attempts = summary_attempts + 1 WHERE id = ? AND generated_title = '' AND summary_status = 'pending'`, now.UTC().Format(time.RFC3339), row.ID)
+	if err != nil {
+		return SearchResult{}, false, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if err := tx.Commit(); err != nil {
+			return SearchResult{}, false, err
+		}
+		return SearchResult{}, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return SearchResult{}, false, err
+	}
+	row.SummaryStatus = "running"
+	row.SummaryError = ""
+	return searchResult(row), true, nil
+}
+
+func (s Store) ResetStaleRunningSummaries(now time.Time, maxAge time.Duration) (int64, error) {
+	if maxAge <= 0 {
+		maxAge = 30 * time.Minute
+	}
+	db, err := s.openInitialized()
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	cutoff := now.Add(-maxAge).UTC().Format(time.RFC3339)
+	res, err := db.Exec(`UPDATE sessions SET summary_status = 'pending', summary_error = 'reset stale running summary after abandoned lease', summary_started_at = '' WHERE summary_status = 'running' AND generated_title = '' AND (summary_started_at = '' OR summary_started_at < ?)`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s Store) SummaryStatusCounts() (map[string]int, error) {
+	db, err := s.openReadOnly()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT summary_status, COUNT(*) FROM sessions GROUP BY summary_status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, err
+		}
+		out[status] = count
+	}
+	return out, rows.Err()
+}
+
 func (s Store) SetSummaryStatus(id, status, message string) error {
 	db, err := s.openInitialized()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	res, err := db.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND generated_title = ''`, status, message, id)
+	startedAt := ""
+	if status == "running" {
+		startedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	res, err := db.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ?, summary_started_at = ? WHERE id = ? AND generated_title = ''`, status, message, startedAt, id)
 	if err != nil {
 		return err
 	}
@@ -848,6 +958,10 @@ func queryStoredRows(db dbtx, query string, args ...any) ([]storedRow, error) {
 				row.SummaryStatus = val
 			case "summary_error":
 				row.SummaryError = val
+			case "summary_started_at":
+				row.SummaryStartedAt = val
+			case "summary_attempts":
+				row.SummaryAttempts, _ = strconv.Atoi(val)
 			}
 		}
 		out = append(out, row)

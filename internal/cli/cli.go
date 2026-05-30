@@ -30,6 +30,7 @@ import (
 )
 
 const serviceLabel = "net.mattwynne.holocron"
+const summaryLeaseTimeout = 30 * time.Minute
 
 type App struct {
 	Stdout     io.Writer
@@ -619,22 +620,8 @@ func (a App) backgroundSummaryWorker(ctx context.Context, writeMu *sync.Mutex) {
 		interval = 30 * time.Second
 	}
 	run := func() {
-		if writeMu != nil {
-			writeMu.Lock()
-			defer writeMu.Unlock()
-		}
-		rows, err := a.store().PendingSummaries(1)
-		if err != nil || len(rows) == 0 {
-			return
-		}
-		row := rows[0]
-		if err := a.store().SetSummaryStatus(row.ID, "running", ""); err != nil {
-			return
-		}
-		result := a.summarizeOne(ctx, cfg, summarizeOptions{}, summarizeJob{Row: row})
-		if result.Err != nil {
-			_ = a.store().SetSummaryStatus(row.ID, "failed", result.Err.Error())
-			fmt.Fprintln(a.Stderr, "holocron background summary:", result.Err)
+		if err := a.runOneBackgroundSummary(ctx, cfg, writeMu); err != nil {
+			fmt.Fprintln(a.Stderr, "holocron background summary:", err)
 		}
 	}
 	run()
@@ -648,6 +635,28 @@ func (a App) backgroundSummaryWorker(ctx context.Context, writeMu *sync.Mutex) {
 			run()
 		}
 	}
+}
+
+func (a App) runOneBackgroundSummary(ctx context.Context, cfg summarizer.Config, writeMu *sync.Mutex) error {
+	if writeMu != nil {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+	}
+	if _, err := a.store().ResetStaleRunningSummaries(a.now(), summaryLeaseTimeout); err != nil {
+		return err
+	}
+	row, ok, err := a.store().ClaimPendingSummary(a.now())
+	if err != nil || !ok {
+		return err
+	}
+	result := a.summarizeOne(ctx, cfg, summarizeOptions{}, summarizeJob{Row: row})
+	if result.Err != nil {
+		if statusErr := a.store().SetSummaryStatus(row.ID, "failed", result.Err.Error()); statusErr != nil {
+			return fmt.Errorf("%v; also failed to mark summary failed: %w", result.Err, statusErr)
+		}
+		return result.Err
+	}
+	return nil
 }
 
 func (a App) summarizeOne(ctx context.Context, cfg summarizer.Config, opts summarizeOptions, job summarizeJob) summarizeResult {
@@ -1018,6 +1027,11 @@ func (a App) daemon() error {
 		lastScan = time.Now()
 	}
 	runScan()
+	if n, err := a.store().ResetStaleRunningSummaries(a.now(), summaryLeaseTimeout); err != nil {
+		fmt.Fprintln(a.Stderr, "holocron daemon:", err)
+	} else if n > 0 {
+		fmt.Fprintf(a.Stderr, "holocron daemon: reset %d stale running summaries\n", n)
+	}
 	go a.backgroundSummaryWorker(ctx, &writeMu)
 	watcher, err := newSourceWatcher(session.DefaultSources(a.Home))
 	if err != nil {
@@ -1581,11 +1595,14 @@ export default function (pi: ExtensionAPI) {
 }
 
 func (a App) serviceStatus() error {
-	if a.daemonRunningFast() {
-		fmt.Fprintln(a.Stdout, "service is running")
-		return nil
+	if !a.daemonRunningFast() {
+		return fmt.Errorf("service is not running")
 	}
-	return fmt.Errorf("service is not running")
+	fmt.Fprintln(a.Stdout, "service is running")
+	if counts, err := a.store().SummaryStatusCounts(); err == nil {
+		fmt.Fprintf(a.Stdout, "summaries: %d pending, %d running, %d failed, %d done\n", counts["pending"], counts["running"], counts["failed"], counts["done"])
+	}
+	return nil
 }
 
 func launchctl(args ...string) error {

@@ -115,6 +115,8 @@ background_interval_seconds = 30
 background_jobs = 1
 ```
 
+Background summaries use recoverable leases. If the daemon restarts while a summary is running, Holocron resets stale running jobs and retries them later. Failed summaries can be retried with `holocron summarize ID --force`. `holocron service status` shows summary queue counts.
+
 Manually register a Pi session outside the default session tree:
 
 ```sh

@@ -381,3 +381,143 @@ func TestGetReportsInvalidStoredResumeArgv(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestInitAddsSummaryLeaseColumns(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`PRAGMA table_info(sessions)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		cols[name] = true
+	}
+	for _, want := range []string{"summary_started_at", "summary_attempts"} {
+		if !cols[want] {
+			t.Fatalf("missing column %s", want)
+		}
+	}
+}
+
+func TestClaimPendingSummarySetsLease(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+	if err := store.Rebuild([]session.Record{untitledSummaryRecord(now, "claim123456")}); err != nil {
+		t.Fatal(err)
+	}
+	row, ok, err := store.ClaimPendingSummary(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || row.ID == "" {
+		t.Fatalf("claim ok=%v row=%#v", ok, row)
+	}
+	got, err := store.Lookup(row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SummaryStatus != "running" || got.SummaryError != "" {
+		t.Fatalf("status/error = %q/%q", got.SummaryStatus, got.SummaryError)
+	}
+	db, err := sql.Open("sqlite", store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var started string
+	var attempts int
+	if err := db.QueryRow(`SELECT summary_started_at, summary_attempts FROM sessions WHERE id = ?`, row.ID).Scan(&started, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if started != now.Format(time.RFC3339) || attempts != 1 {
+		t.Fatalf("lease = %q attempts=%d", started, attempts)
+	}
+}
+
+func TestResetStaleRunningSummaries(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+	if err := store.Rebuild([]session.Record{untitledSummaryRecord(now, "stale123456")}); err != nil {
+		t.Fatal(err)
+	}
+	row, ok, err := store.ClaimPendingSummary(now.Add(-2 * time.Hour))
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	n, err := store.ResetStaleRunningSummaries(now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("reset %d rows", n)
+	}
+	got, err := store.Lookup(row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SummaryStatus != "pending" || !strings.Contains(got.SummaryError, "reset stale running summary") {
+		t.Fatalf("status/error = %q/%q", got.SummaryStatus, got.SummaryError)
+	}
+}
+
+func TestResetStaleRunningSummariesKeepsFreshLease(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+	if err := store.Rebuild([]session.Record{untitledSummaryRecord(now, "fresh123456")}); err != nil {
+		t.Fatal(err)
+	}
+	row, ok, err := store.ClaimPendingSummary(now.Add(-5 * time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	n, err := store.ResetStaleRunningSummaries(now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("reset %d rows", n)
+	}
+	got, err := store.Lookup(row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SummaryStatus != "running" {
+		t.Fatalf("status = %q", got.SummaryStatus)
+	}
+}
+
+func TestSummaryStatusCounts(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+	if err := store.Rebuild([]session.Record{untitledSummaryRecord(now, "counts123456")}); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := store.SummaryStatusCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts["pending"] != 1 {
+		t.Fatalf("counts = %#v", counts)
+	}
+}
+
+func untitledSummaryRecord(now time.Time, id string) session.Record {
+	return session.Record{Tool: session.ToolPi, SourcePath: "/tmp/" + id + ".jsonl", SessionID: id, Title: "(untitled session)", FirstPrompt: "(untitled session)", CWD: "/tmp", CreatedAt: now, UpdatedAt: now, ResumeArgv: []string{"pi"}, ResumeCommand: "pi", Transcript: "user: hello"}
+}
