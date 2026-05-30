@@ -199,9 +199,44 @@ ORDER BY bm25(sessions_fts, 10.0, 10.0, 3.0, 1.0)
 LIMIT ?`, ftsQuery(query), limit)
 }
 
+func (s Store) SearchInFolder(query, folder string, limit int) ([]SearchResult, error) {
+	folder = filepath.Clean(folder)
+	if strings.TrimSpace(query) == "" {
+		return s.RecentInFolder(folder, limit)
+	}
+	return s.readRows(`SELECT s.id, s.tool, s.title, s.first_prompt, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command, s.generated_title, s.generated_summary, s.generated_at, s.generated_by, s.summary_status, s.summary_error
+FROM sessions_fts f JOIN sessions s ON s.id = f.id
+WHERE sessions_fts MATCH ? AND (s.cwd = ? OR s.cwd LIKE ? ESCAPE '\')
+ORDER BY bm25(sessions_fts, 10.0, 10.0, 3.0, 1.0)
+LIMIT ?`, ftsQuery(query), folder, childFolderPattern(folder), limit)
+}
+
 func (s Store) Recent(limit int) ([]SearchResult, error) {
 	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error
 FROM sessions ORDER BY updated_at DESC LIMIT ?`, limit)
+}
+
+func (s Store) RecentInFolder(folder string, limit int) ([]SearchResult, error) {
+	folder = filepath.Clean(folder)
+	return s.readRows(`SELECT id, tool, title, first_prompt, cwd, updated_at, file_size_bytes, message_count, resume_argv, resume_command, generated_title, generated_summary, generated_at, generated_by, summary_status, summary_error
+FROM sessions
+WHERE cwd = ? OR cwd LIKE ? ESCAPE '\'
+ORDER BY updated_at DESC LIMIT ?`, folder, childFolderPattern(folder), limit)
+}
+
+func childFolderPattern(folder string) string {
+	clean := filepath.Clean(folder)
+	if clean == string(filepath.Separator) {
+		return string(filepath.Separator) + "%"
+	}
+	return escapeLike(clean) + string(filepath.Separator) + "%"
+}
+
+func escapeLike(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	value = strings.ReplaceAll(value, `_`, `\_`)
+	return value
 }
 
 func (s Store) UpdatedBetween(start, end time.Time, limit int) ([]SearchResult, error) {

@@ -36,10 +36,16 @@ That extension registers project-local Pi sessions that are not stored under the
 
 ## Use
 
-Search sessions:
+Search sessions from the current folder tree:
 
 ```sh
 holocron search "auth redirect"
+```
+
+Search across all indexed folders:
+
+```sh
+holocron search "auth redirect" --all
 ```
 
 Search as JSON:
@@ -55,11 +61,12 @@ holocron today
 holocron today --json
 ```
 
-Pick and reopen a session in the TUI:
+Pick and reopen a session in the TUI, scoped to the current folder tree by default:
 
 ```sh
 holocron pick
 holocron pick "auth redirect"
+holocron pick --all "auth redirect"
 ```
 
 Open a result by ID in its native tool:

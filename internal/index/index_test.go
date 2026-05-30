@@ -99,6 +99,84 @@ func TestSearchUsesBoundParametersForQuotesAndMetacharacters(t *testing.T) {
 	}
 }
 
+func TestSearchInFolderMatchesCurrentFolderAndDescendantsOnly(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	now := time.Date(2026, 5, 30, 10, 0, 0, 0, time.UTC)
+	records := []session.Record{
+		searchRecord(t, "exact123456", "Exact auth", "/tmp/project", now),
+		searchRecord(t, "child123456", "Child auth", "/tmp/project/internal", now.Add(time.Minute)),
+		searchRecord(t, "sibling123456", "Sibling auth", "/tmp/project-other", now.Add(2*time.Minute)),
+		searchRecord(t, "other123456", "Other auth", "/tmp/other", now.Add(3*time.Minute)),
+	}
+	if err := store.Rebuild(records); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.SearchInFolder("auth", "/tmp/project", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resultIDSet(results)
+	for _, want := range []string{"cx:exact123", "cx:child123"} {
+		if !got[want] {
+			t.Fatalf("ids = %#v, missing %s", resultIDs(results), want)
+		}
+	}
+	for _, unwanted := range []string{"cx:sibling", "cx:other12"} {
+		if got[unwanted] {
+			t.Fatalf("ids = %#v, included %s", resultIDs(results), unwanted)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %#v", resultIDs(results))
+	}
+}
+
+func TestSearchInFolderEscapesLikeWildcards(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	now := time.Date(2026, 5, 30, 10, 0, 0, 0, time.UTC)
+	records := []session.Record{
+		searchRecord(t, "under123456", "Under auth", "/tmp/project_1/child", now),
+		searchRecord(t, "wild123456", "Wildcard auth", "/tmp/projecta1/child", now.Add(time.Minute)),
+	}
+	if err := store.Rebuild(records); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.SearchInFolder("auth", "/tmp/project_1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resultIDs(results)
+	want := []string{"cx:under123"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ids = %#v, want %#v", got, want)
+	}
+}
+
+func TestRecentInFolderMatchesCurrentFolderAndDescendantsOnly(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	now := time.Date(2026, 5, 30, 10, 0, 0, 0, time.UTC)
+	records := []session.Record{
+		searchRecord(t, "old123456", "Old", "/tmp/project", now),
+		searchRecord(t, "new123456", "New", "/tmp/project/internal", now.Add(time.Minute)),
+		searchRecord(t, "bad123456", "Bad", "/tmp/project-other", now.Add(2*time.Minute)),
+	}
+	if err := store.Rebuild(records); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.RecentInFolder("/tmp/project", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resultIDs(results)
+	want := []string{"cx:new12345", "cx:old12345"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ids = %#v, want %#v", got, want)
+	}
+}
+
 func TestUpdatedBetweenReturnsSessionsAcrossToolsNewestFirst(t *testing.T) {
 	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
 	records := []session.Record{
@@ -520,4 +598,37 @@ func TestSummaryStatusCounts(t *testing.T) {
 
 func untitledSummaryRecord(now time.Time, id string) session.Record {
 	return session.Record{Tool: session.ToolPi, SourcePath: "/tmp/" + id + ".jsonl", SessionID: id, Title: "(untitled session)", FirstPrompt: "(untitled session)", CWD: "/tmp", CreatedAt: now, UpdatedAt: now, ResumeArgv: []string{"pi"}, ResumeCommand: "pi", Transcript: "user: hello"}
+}
+
+func searchRecord(t *testing.T, sessionID, title, cwd string, updatedAt time.Time) session.Record {
+	t.Helper()
+	return session.Record{
+		Tool:          session.ToolCodex,
+		SourcePath:    filepath.Join(t.TempDir(), sessionID+".jsonl"),
+		SessionID:     sessionID,
+		Title:         title,
+		FirstPrompt:   title,
+		CWD:           cwd,
+		CreatedAt:     updatedAt.Add(-time.Hour),
+		UpdatedAt:     updatedAt,
+		ResumeArgv:    []string{"codex", "resume", sessionID},
+		ResumeCommand: "cd " + cwd + " && exec codex resume " + sessionID,
+		Transcript:    title,
+	}
+}
+
+func resultIDs(results []SearchResult) []string {
+	ids := make([]string, 0, len(results))
+	for _, result := range results {
+		ids = append(ids, result.ID)
+	}
+	return ids
+}
+
+func resultIDSet(results []SearchResult) map[string]bool {
+	ids := map[string]bool{}
+	for _, result := range results {
+		ids[result.ID] = true
+	}
+	return ids
 }

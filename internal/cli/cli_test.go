@@ -40,7 +40,7 @@ func TestSearchJSONCommand(t *testing.T) {
 	t.Setenv("HOLOCRON_SKIP_SERVICE_CHECK", "1")
 	var out bytes.Buffer
 	app.Stdout = &out
-	code := app.Run([]string{"search", "auth", "--json"})
+	code := app.Run([]string{"search", "auth", "--json", "--all"})
 	if code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
@@ -85,13 +85,110 @@ func TestSearchTableShowsFolder(t *testing.T) {
 	t.Setenv("HOLOCRON_SKIP_SERVICE_CHECK", "1")
 	var out bytes.Buffer
 	app.Stdout = &out
-	code := app.Run([]string{"search", "auth"})
+	code := app.Run([]string{"search", "auth", "--all"})
 	if code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
 	for _, want := range []string{"FOLDER", "project", "Fix auth redirect handling"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("table missing %q: %s", want, out.String())
+		}
+	}
+}
+
+func TestSearchDefaultsToCurrentFolderScope(t *testing.T) {
+	home := canonicalTempDir(t)
+	project := filepath.Join(home, "project")
+	child := filepath.Join(project, "internal")
+	other := filepath.Join(home, "other")
+	srcRoot := filepath.Join(home, ".codex", "sessions")
+	for _, dir := range []string{project, child, other, srcRoot} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCodexSession(t, filepath.Join(srcRoot, "project.jsonl"), "project123456", project, "Fix local auth")
+	writeCodexSession(t, filepath.Join(srcRoot, "child.jsonl"), "child123456", child, "Fix child auth")
+	writeCodexSession(t, filepath.Join(srcRoot, "other.jsonl"), "other123456", other, "Fix global auth")
+
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOLOCRON_SKIP_SERVICE_CHECK", "1")
+	withWorkingDir(t, project, func() {
+		var out bytes.Buffer
+		app.Stdout = &out
+		if code := app.Run([]string{"search", "auth"}); code != 0 {
+			t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+		}
+		for _, want := range []string{"Fix local auth", "Fix child auth"} {
+			if !strings.Contains(out.String(), want) {
+				t.Fatalf("missing %q: %s", want, out.String())
+			}
+		}
+		if strings.Contains(out.String(), "Fix global auth") {
+			t.Fatalf("included global result: %s", out.String())
+		}
+	})
+}
+
+func TestSearchAllSearchesAcrossFolders(t *testing.T) {
+	home := canonicalTempDir(t)
+	project := filepath.Join(home, "project")
+	other := filepath.Join(home, "other")
+	srcRoot := filepath.Join(home, ".codex", "sessions")
+	for _, dir := range []string{project, other, srcRoot} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCodexSession(t, filepath.Join(srcRoot, "project.jsonl"), "project123456", project, "Fix local auth")
+	writeCodexSession(t, filepath.Join(srcRoot, "other.jsonl"), "other123456", other, "Fix global auth")
+
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOLOCRON_SKIP_SERVICE_CHECK", "1")
+	withWorkingDir(t, project, func() {
+		var out bytes.Buffer
+		app.Stdout = &out
+		if code := app.Run([]string{"search", "auth", "--all"}); code != 0 {
+			t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
+		}
+		for _, want := range []string{"Fix local auth", "Fix global auth"} {
+			if !strings.Contains(out.String(), want) {
+				t.Fatalf("missing %q: %s", want, out.String())
+			}
+		}
+	})
+}
+
+func TestParsePickArgsSupportsAll(t *testing.T) {
+	query, all, err := parsePickArgs([]string{"--all", "auth", "redirect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if query != "auth redirect" || !all {
+		t.Fatalf("query=%q all=%v", query, all)
+	}
+}
+
+func TestParsePickArgsRejectsUnknownFlag(t *testing.T) {
+	_, _, err := parsePickArgs([]string{"--bogus"})
+	if err == nil || !strings.Contains(err.Error(), "unknown pick flag --bogus") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestUsageMentionsAllFlagForSearchAndPick(t *testing.T) {
+	var out bytes.Buffer
+	app := App{Stdout: &out}
+	app.Usage()
+	for _, want := range []string{"holocron search Q [--json] [--all]", "holocron pick [--all] [Q]"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("usage missing %q:\n%s", want, out.String())
 		}
 	}
 }
@@ -189,7 +286,7 @@ func TestRegisterSessionIndexesProjectLocalPiSession(t *testing.T) {
 	t.Setenv("HOLOCRON_SKIP_SERVICE_CHECK", "1")
 	var out bytes.Buffer
 	app.Stdout = &out
-	if code := app.Run([]string{"search", "KMC Mike", "--json"}); code != 0 {
+	if code := app.Run([]string{"search", "KMC Mike", "--json", "--all"}); code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
 	for _, want := range []string{`"tool": "pi"`, `"folder": "project"`, sessionFile} {
@@ -202,7 +299,7 @@ func TestRegisterSessionIndexesProjectLocalPiSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Reset()
-	if code := app.Run([]string{"search", "KMC Mike", "--json"}); code != 0 {
+	if code := app.Run([]string{"search", "KMC Mike", "--json", "--all"}); code != 0 {
 		t.Fatalf("exit code = %d stderr=%s", code, app.Stderr)
 	}
 	if !strings.Contains(out.String(), sessionFile) {
@@ -679,11 +776,45 @@ func TestSourceWatcherNoticesNewSubdirectory(t *testing.T) {
 	}
 }
 
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeCodexSession(t *testing.T, path, id, cwd, prompt string) {
+	t.Helper()
+	writeFile(t, path, strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"` + id + `","timestamp":"2026-05-30T10:00:00Z","cwd":` + quote(cwd) + `}}`,
+		`{"role":"user","content":` + quote(prompt) + `}`,
+	}, "\n")+"\n")
+}
+
+func withWorkingDir(t *testing.T, dir string, fn func()) {
+	t.Helper()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(old); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	fn()
 }
 
 func waitWatcherEvent(t *testing.T, events <-chan struct{}) {

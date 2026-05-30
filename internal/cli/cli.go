@@ -115,9 +115,9 @@ func (a App) Usage() {
 	fmt.Fprintln(a.Stdout, `holocron - search and reopen your AI coding agent sessions
 
 Usage:
-  holocron search Q [--json]        Search indexed sessions
-  holocron today [--json]           List sessions updated in the last 24 hours
-  holocron pick [Q]                 Pick and reopen a session in the TUI
+  holocron search Q [--json] [--all] Search indexed sessions from the current folder tree
+  holocron today [--json]            List sessions updated in the last 24 hours
+  holocron pick [--all] [Q]          Pick and reopen a session in the TUI
   holocron open ID                  Reopen an indexed session in its native tool
   holocron ask ID [QUESTION]        Ask one question about an indexed session
   holocron view ID [--model MODEL]  View an indexed session in Pi
@@ -136,7 +136,7 @@ func (a App) store() index.Store {
 }
 
 func (a App) search(args []string) error {
-	query, jsonOut, err := parseSearchArgs(args)
+	query, jsonOut, all, err := parseSearchArgs(args)
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,17 @@ func (a App) search(args []string) error {
 	}
 	stop := a.startSpinner("Searching sessions")
 	defer stop()
-	results, err := a.store().Search(query, 100)
+	store := a.store()
+	var results []index.SearchResult
+	if all {
+		results, err = store.Search(query, 100)
+	} else {
+		cwd, cwdErr := os.Getwd()
+		if cwdErr != nil {
+			return fmt.Errorf("cannot determine current folder: %w", cwdErr)
+		}
+		results, err = store.SearchInFolder(query, cwd, 100)
+	}
 	if err != nil {
 		return err
 	}
@@ -183,7 +193,19 @@ func (a App) today(args []string) error {
 }
 
 func (a App) pick(args []string) error {
-	result, err := tui.PickWithStatus(a.store(), strings.Join(args, " "), a.Stdout, a.Stderr, func() string {
+	query, all, err := parsePickArgs(args)
+	if err != nil {
+		return err
+	}
+	var store tui.Store = a.store()
+	if !all {
+		cwd, cwdErr := os.Getwd()
+		if cwdErr != nil {
+			return fmt.Errorf("cannot determine current folder: %w", cwdErr)
+		}
+		store = scopedPickerStore{store: a.store(), folder: cwd}
+	}
+	result, err := tui.PickWithStatus(store, query, a.Stdout, a.Stderr, func() string {
 		if a.daemonRunningFast() {
 			return "daemon running"
 		}
@@ -803,21 +825,54 @@ func parseTodayArgs(args []string) (bool, error) {
 	return jsonOut, nil
 }
 
-func parseSearchArgs(args []string) (string, bool, error) {
+func parseSearchArgs(args []string) (string, bool, bool, error) {
 	var jsonOut bool
+	var all bool
 	var terms []string
 	for _, arg := range args {
 		switch arg {
 		case "--json":
 			jsonOut = true
+		case "--all":
+			all = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return "", false, fmt.Errorf("unknown search flag %s", arg)
+				return "", false, false, fmt.Errorf("unknown search flag %s", arg)
 			}
 			terms = append(terms, arg)
 		}
 	}
-	return strings.Join(terms, " "), jsonOut, nil
+	return strings.Join(terms, " "), jsonOut, all, nil
+}
+
+func parsePickArgs(args []string) (string, bool, error) {
+	var all bool
+	var terms []string
+	for _, arg := range args {
+		switch arg {
+		case "--all":
+			all = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", false, fmt.Errorf("unknown pick flag %s", arg)
+			}
+			terms = append(terms, arg)
+		}
+	}
+	return strings.Join(terms, " "), all, nil
+}
+
+type scopedPickerStore struct {
+	store  index.Store
+	folder string
+}
+
+func (s scopedPickerStore) Search(query string, limit int) ([]index.SearchResult, error) {
+	return s.store.SearchInFolder(query, s.folder, limit)
+}
+
+func (s scopedPickerStore) Recent(limit int) ([]index.SearchResult, error) {
+	return s.store.RecentInFolder(s.folder, limit)
 }
 
 func printTable(w io.Writer, results []index.SearchResult) {
