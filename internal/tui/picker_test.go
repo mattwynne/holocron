@@ -89,6 +89,23 @@ func TestCtrlUClearsQuery(t *testing.T) {
 	}
 }
 
+func TestRenderRowSanitizesAndTruncatesTitle(t *testing.T) {
+	m := NewModel(&fakeStore{}, "")
+	m.width = 32
+	m.results = []index.SearchResult{{ID: "pi:abc", Tool: "pi", Title: "first line\nsecond\tline " + strings.Repeat("x", 80), CWD: "/tmp/project"}}
+	row := m.renderRow(0)
+	lines := strings.Split(row, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("row should render exactly two lines, got %d: %q", len(lines), row)
+	}
+	if strings.Contains(lines[0], "\t") || strings.Contains(lines[0], "second\tline") || !strings.Contains(lines[0], "first line second line") {
+		t.Fatalf("title was not collapsed: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "…") {
+		t.Fatalf("title was not truncated: %q", lines[0])
+	}
+}
+
 func TestRenderRowShowsFolderIDAndSizeBar(t *testing.T) {
 	m := NewModel(&fakeStore{}, "")
 	m.results = []index.SearchResult{

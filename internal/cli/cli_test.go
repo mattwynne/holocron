@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mattwynne/holocron/internal/index"
 	"github.com/mattwynne/holocron/internal/session"
 )
 
@@ -79,6 +80,28 @@ func TestSearchTableShowsFolder(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("table missing %q: %s", want, out.String())
 		}
+	}
+}
+
+func TestSearchTableSanitizesAndTruncatesTitles(t *testing.T) {
+	var out bytes.Buffer
+	printTable(&out, []index.SearchResult{{
+		ID:        "pi:abc123",
+		Tool:      "pi",
+		UpdatedAt: "2026-05-29T10:00:00Z",
+		Size:      "1 KB",
+		Folder:    "project",
+		Title:     "first line\nsecond\tline " + strings.Repeat("x", 100),
+	}})
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, output:\n%s", len(lines), out.String())
+	}
+	if strings.Contains(lines[1], "\t") || strings.Contains(lines[1], "\n") || !strings.Contains(lines[1], "first line second line") {
+		t.Fatalf("title was not collapsed to one line: %q", lines[1])
+	}
+	if !strings.Contains(lines[1], "…") {
+		t.Fatalf("title was not truncated: %q", lines[1])
 	}
 }
 

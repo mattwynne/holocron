@@ -534,7 +534,8 @@ func printTable(w io.Writer, results []index.SearchResult) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tTOOL\tUPDATED\tSIZE\tFOLDER\tTITLE")
 	for _, r := range results {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, shortDate(r.UpdatedAt), r.Size, r.Folder, r.Title)
+		updated := shortDate(r.UpdatedAt)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, updated, r.Size, r.Folder, displayTableTitle(r.Title, tableTitleWidth(w, r.ID, r.Tool, updated, r.Size, r.Folder)))
 	}
 	_ = tw.Flush()
 }
@@ -543,9 +544,40 @@ func printTodayTable(w io.Writer, results []index.SearchResult) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tTOOL\tUPDATED\tSIZE\tFOLDER\tTITLE")
 	for _, r := range results {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, shortDateTime(r.UpdatedAt), r.Size, r.Folder, r.Title)
+		updated := shortDateTime(r.UpdatedAt)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Tool, updated, r.Size, r.Folder, displayTableTitle(r.Title, tableTitleWidth(w, r.ID, r.Tool, updated, r.Size, r.Folder)))
 	}
 	_ = tw.Flush()
+}
+
+func displayTableTitle(title string, width int) string {
+	return truncateRunes(strings.Join(strings.Fields(title), " "), width)
+}
+
+func tableTitleWidth(_ io.Writer, fields ...string) int {
+	columns := 100
+	if value := os.Getenv("COLUMNS"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			columns = parsed
+		}
+	}
+	used := 0
+	for _, field := range fields {
+		used += len([]rune(field))
+	}
+	// Account for tabwriter padding between the six visible columns.
+	return columns - used - 14
+}
+
+func truncateRunes(s string, width int) string {
+	if width <= 1 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= width {
+		return s
+	}
+	return string(r[:width-1]) + "…"
 }
 
 func (a App) now() time.Time {

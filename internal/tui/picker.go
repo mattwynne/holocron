@@ -231,7 +231,9 @@ func (m Model) renderRow(i int) string {
 	if r.Folder != "" && r.Folder != r.CWD {
 		detail = fmt.Sprintf("%s  %s", r.Folder, r.CWD)
 	}
-	line1 := truncate(fmt.Sprintf("%s%s  %s", prefix, r.Title, r.ID), m.width)
+	title := singleLine(r.Title)
+	detail = singleLine(detail)
+	line1 := truncate(fmt.Sprintf("%s%s  %s", prefix, title, r.ID), m.width)
 	line2 := truncate(fmt.Sprintf("  %-6s %s  %s  %s", r.Tool, date, bar, detail), m.width)
 	return style.Render(line1) + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(line2)
 }
@@ -299,6 +301,10 @@ func pageSize(height int) int {
 		return 3
 	}
 	return n / 2
+}
+
+func singleLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func truncate(s string, width int) string {
