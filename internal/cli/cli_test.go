@@ -468,6 +468,14 @@ func TestAskCommandReadsQuestionFromStdin(t *testing.T) {
 	}
 }
 
+func TestAskSpinnerLabelIncludesSessionTitleAndFolder(t *testing.T) {
+	got := askSpinnerLabel(index.SearchResult{ID: "cx:abc12345", Title: "first\nsecond", Folder: "project"})
+	want := "asking session 'first second' in 'project'..."
+	if got != want {
+		t.Fatalf("label = %q want %q", got, want)
+	}
+}
+
 func TestAskCancelsPiWhenContextCancelled(t *testing.T) {
 	home, _, _ := setupAskFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())

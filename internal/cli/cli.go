@@ -232,7 +232,7 @@ func (a App) ask(args []string) error {
 	prompt := askprompt.BuildPrompt(promptCtx, question, cfg.MaxInputTokens)
 	cmdCtx, cancel := a.commandContext()
 	defer cancel()
-	stop := a.startSpinner("Thinking")
+	stop := a.startSpinner(askSpinnerLabel(row))
 	answer, err := llm.Runner{Config: cfg}.RunPrompt(cmdCtx, prompt)
 	stop()
 	if err != nil {
@@ -272,6 +272,21 @@ func displayTitle(row index.SearchResult) string {
 		return row.GeneratedTitle
 	}
 	return row.Title
+}
+
+func askSpinnerLabel(row index.SearchResult) string {
+	title := strings.Join(strings.Fields(displayTitle(row)), " ")
+	if title == "" {
+		title = row.ID
+	}
+	folder := strings.Join(strings.Fields(row.Folder), " ")
+	if folder == "" {
+		folder = strings.Join(strings.Fields(row.CWD), " ")
+	}
+	if folder == "" {
+		folder = "unknown folder"
+	}
+	return fmt.Sprintf("asking session '%s' in '%s'...", title, folder)
 }
 
 func (a App) view(args []string) error {
