@@ -106,6 +106,43 @@ func TestRenderRowSanitizesAndTruncatesTitle(t *testing.T) {
 	}
 }
 
+func TestViewKeepsResultsVisibleWhileRefreshing(t *testing.T) {
+	m := NewModel(&fakeStore{}, "auth")
+	m.loading = true
+	m.results = []index.SearchResult{{ID: "pi:abc", Tool: "pi", Title: "Existing result", CWD: "/tmp/project"}}
+	view := m.View()
+	if !strings.Contains(view, "Existing result") {
+		t.Fatalf("view hid existing result while refreshing: %q", view)
+	}
+	if !strings.Contains(view, "refreshing...") {
+		t.Fatalf("view missing refreshing status: %q", view)
+	}
+	if strings.Contains(view, "loading...") {
+		t.Fatalf("view showed initial loading state while results existed: %q", view)
+	}
+}
+
+func TestViewShowsLoadingBeforeInitialResults(t *testing.T) {
+	m := NewModel(&fakeStore{}, "auth")
+	m.loading = true
+	view := m.View()
+	if !strings.Contains(view, "loading...") {
+		t.Fatalf("view missing loading state: %q", view)
+	}
+}
+
+func TestRenderRowShowsHighlightedSnippet(t *testing.T) {
+	m := NewModel(&fakeStore{}, "")
+	m.width = 80
+	m.results = []index.SearchResult{{ID: "pi:abc", Tool: "pi", Title: "Fix auth", CWD: "/tmp/project", Snippet: "fixed the ⟪auth⟫ ⟪redirect⟫ callback"}}
+	row := m.renderRow(0)
+	for _, want := range []string{"fixed the", "auth", "redirect", "callback"} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("row missing %q: %q", want, row)
+		}
+	}
+}
+
 func TestRenderRowShowsFolderIDAndSizeBar(t *testing.T) {
 	m := NewModel(&fakeStore{}, "")
 	m.results = []index.SearchResult{

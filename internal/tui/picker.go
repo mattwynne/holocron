@@ -185,6 +185,9 @@ func (m Model) View() string {
 	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 
 	help := "type to search • enter open • esc quit"
+	if m.loading && len(m.results) > 0 {
+		help += " • refreshing..."
+	}
 	if m.status != "" {
 		help += " • " + m.status
 	}
@@ -193,11 +196,7 @@ func (m Model) View() string {
 
 	if m.err != nil {
 		fmt.Fprintf(&b, "%s\n", errorStyle.Render(m.err.Error()))
-	} else if m.loading {
-		fmt.Fprintf(&b, "%s\n", muted.Render("loading..."))
-	} else if len(m.results) == 0 {
-		fmt.Fprintf(&b, "%s\n", muted.Render("no sessions found"))
-	} else {
+	} else if len(m.results) > 0 {
 		visible := pageSize(m.height)
 		start := 0
 		if m.selected >= visible {
@@ -211,6 +210,10 @@ func (m Model) View() string {
 			b.WriteString(m.renderRow(i))
 			b.WriteByte('\n')
 		}
+	} else if m.loading {
+		fmt.Fprintf(&b, "%s\n", muted.Render("loading..."))
+	} else {
+		fmt.Fprintf(&b, "%s\n", muted.Render("no sessions found"))
 	}
 
 	fmt.Fprintf(&b, "\n%s", muted.Render("↑/↓ move • ctrl-u clear • pgup/pgdn page"))
@@ -235,7 +238,48 @@ func (m Model) renderRow(i int) string {
 	detail = singleLine(detail)
 	line1 := truncate(fmt.Sprintf("%s%s  %s", prefix, title, r.ID), m.width)
 	line2 := truncate(fmt.Sprintf("  %-6s %s  %s  %s", r.Tool, date, bar, detail), m.width)
-	return style.Render(line1) + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(line2)
+	row := style.Render(line1) + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(line2)
+	if r.Snippet != "" {
+		row += "\n" + renderSnippet(r.Snippet, m.width)
+	}
+	return row
+}
+
+func renderSnippet(snippet string, width int) string {
+	return "  " + highlightedSnippet(singleLine(snippet), width-2)
+}
+
+func highlightedSnippet(snippet string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	highlight := lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("11"))
+	var b strings.Builder
+	matched := false
+	visible := 0
+	for _, r := range snippet {
+		switch r {
+		case '⟪':
+			matched = true
+			continue
+		case '⟫':
+			matched = false
+			continue
+		}
+		if visible >= width {
+			b.WriteString(muted.Render("…"))
+			break
+		}
+		text := string(r)
+		if matched {
+			b.WriteString(highlight.Render(text))
+		} else {
+			b.WriteString(muted.Render(text))
+		}
+		visible++
+	}
+	return b.String()
 }
 
 func (m Model) maxFileSize() int64 {
@@ -300,7 +344,7 @@ func pageSize(height int) int {
 	if n < 3 {
 		return 3
 	}
-	return n / 2
+	return n / 3
 }
 
 func singleLine(s string) string {

@@ -99,6 +99,26 @@ func TestSearchUsesBoundParametersForQuotesAndMetacharacters(t *testing.T) {
 	}
 }
 
+func TestSearchReturnsMatchSnippet(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	rec := searchRecord(t, "snippet123456", "Investigate login", "/tmp/project", time.Date(2026, 5, 30, 10, 0, 0, 0, time.UTC))
+	rec.Transcript = "We traced the OAuth callback and fixed the redirect handling."
+	if err := store.Rebuild([]session.Record{rec}); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.Search("OAuth redirect", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %d", len(results))
+	}
+	if !strings.Contains(results[0].Snippet, "⟪OAuth⟫") || !strings.Contains(results[0].Snippet, "⟪redirect⟫") {
+		t.Fatalf("snippet did not mark matches: %q", results[0].Snippet)
+	}
+}
+
 func TestSearchInFolderMatchesCurrentFolderAndDescendantsOnly(t *testing.T) {
 	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
 	now := time.Date(2026, 5, 30, 10, 0, 0, 0, time.UTC)

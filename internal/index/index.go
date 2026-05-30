@@ -39,6 +39,7 @@ type SearchResult struct {
 	GeneratedSummary string   `json:"generated_summary,omitempty"`
 	GeneratedAt      string   `json:"generated_at,omitempty"`
 	GeneratedBy      string   `json:"generated_by,omitempty"`
+	Snippet          string   `json:"snippet,omitempty"`
 	SummaryStatus    string   `json:"summary_status,omitempty"`
 	SummaryError     string   `json:"summary_error,omitempty"`
 }
@@ -61,6 +62,7 @@ type storedRow struct {
 	GeneratedSummary string
 	GeneratedAt      string
 	GeneratedBy      string
+	Snippet          string
 	SummaryStatus    string
 	SummaryError     string
 	SummaryStartedAt string
@@ -192,7 +194,7 @@ func (s Store) Search(query string, limit int) ([]SearchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return s.Recent(limit)
 	}
-	return s.readRows(`SELECT s.id, s.tool, s.title, s.first_prompt, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command, s.generated_title, s.generated_summary, s.generated_at, s.generated_by, s.summary_status, s.summary_error
+	return s.readRows(`SELECT s.id, s.tool, s.title, s.first_prompt, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command, s.generated_title, s.generated_summary, s.generated_at, s.generated_by, snippet(sessions_fts, -1, '⟪', '⟫', '…', 12) AS snippet, s.summary_status, s.summary_error
 FROM sessions_fts f JOIN sessions s ON s.id = f.id
 WHERE sessions_fts MATCH ?
 ORDER BY bm25(sessions_fts, 10.0, 10.0, 3.0, 1.0)
@@ -204,7 +206,7 @@ func (s Store) SearchInFolder(query, folder string, limit int) ([]SearchResult, 
 	if strings.TrimSpace(query) == "" {
 		return s.RecentInFolder(folder, limit)
 	}
-	return s.readRows(`SELECT s.id, s.tool, s.title, s.first_prompt, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command, s.generated_title, s.generated_summary, s.generated_at, s.generated_by, s.summary_status, s.summary_error
+	return s.readRows(`SELECT s.id, s.tool, s.title, s.first_prompt, s.cwd, s.updated_at, s.file_size_bytes, s.message_count, s.resume_argv, s.resume_command, s.generated_title, s.generated_summary, s.generated_at, s.generated_by, snippet(sessions_fts, -1, '⟪', '⟫', '…', 12) AS snippet, s.summary_status, s.summary_error
 FROM sessions_fts f JOIN sessions s ON s.id = f.id
 WHERE sessions_fts MATCH ? AND (s.cwd = ? OR s.cwd LIKE ? ESCAPE '\')
 ORDER BY bm25(sessions_fts, 10.0, 10.0, 3.0, 1.0)
@@ -359,6 +361,7 @@ func (s Store) readRows(query string, args ...any) ([]SearchResult, error) {
 			GeneratedSummary: row.GeneratedSummary,
 			GeneratedAt:      row.GeneratedAt,
 			GeneratedBy:      row.GeneratedBy,
+			Snippet:          row.Snippet,
 			SummaryStatus:    row.SummaryStatus,
 			SummaryError:     row.SummaryError,
 		})
@@ -368,7 +371,7 @@ func (s Store) readRows(query string, args ...any) ([]SearchResult, error) {
 
 func searchResult(row storedRow) SearchResult {
 	argv, _ := decodeArgv(row.ResumeArgv, row.ID)
-	return SearchResult{ID: row.ID, Tool: row.Tool, Title: displayTitle(row), Folder: FolderName(row.CWD), CWD: row.CWD, UpdatedAt: row.UpdatedAt, Size: HumanSize(row.FileSizeBytes), FileSizeBytes: row.FileSizeBytes, MessageCount: row.MessageCount, ResumeArgv: argv, ResumeCommand: row.ResumeCommand, GeneratedTitle: row.GeneratedTitle, GeneratedSummary: row.GeneratedSummary, GeneratedAt: row.GeneratedAt, GeneratedBy: row.GeneratedBy, SummaryStatus: row.SummaryStatus, SummaryError: row.SummaryError}
+	return SearchResult{ID: row.ID, Tool: row.Tool, Title: displayTitle(row), Folder: FolderName(row.CWD), CWD: row.CWD, UpdatedAt: row.UpdatedAt, Size: HumanSize(row.FileSizeBytes), FileSizeBytes: row.FileSizeBytes, MessageCount: row.MessageCount, ResumeArgv: argv, ResumeCommand: row.ResumeCommand, GeneratedTitle: row.GeneratedTitle, GeneratedSummary: row.GeneratedSummary, GeneratedAt: row.GeneratedAt, GeneratedBy: row.GeneratedBy, Snippet: row.Snippet, SummaryStatus: row.SummaryStatus, SummaryError: row.SummaryError}
 }
 
 func (s Store) openReadOnly() (*sql.DB, error) {
@@ -989,6 +992,8 @@ func queryStoredRows(db dbtx, query string, args ...any) ([]storedRow, error) {
 				row.GeneratedAt = val
 			case "generated_by":
 				row.GeneratedBy = val
+			case "snippet":
+				row.Snippet = val
 			case "summary_status":
 				row.SummaryStatus = val
 			case "summary_error":
