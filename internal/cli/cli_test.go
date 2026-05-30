@@ -222,7 +222,7 @@ func TestSummarizeDryRunUsesConfiguredModelCommand(t *testing.T) {
 	if err := os.Chmod(script, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[summarizer]\ncommand = ["+quote(script)+"]\n")
+	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[pi]\nexecutable = "+quote(script)+"\n")
 	sessionFile := filepath.Join(srcRoot, "codex.jsonl")
 	writeFile(t, sessionFile, strings.Join([]string{
 		`{"type":"session_meta","payload":{"id":"sum123456789","timestamp":"2026-05-13T10:00:00Z","cwd":` + quote(project) + `}}`,
@@ -257,7 +257,7 @@ func TestSummarizeSkipsExistingGeneratedMetadataWithoutForce(t *testing.T) {
 	if err := os.Chmod(script, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[summarizer]\ncommand = ["+quote(script)+"]\n")
+	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[pi]\nexecutable = "+quote(script)+"\n")
 	sessionFile := filepath.Join(srcRoot, "codex.jsonl")
 	writeFile(t, sessionFile, strings.Join([]string{
 		`{"type":"session_meta","payload":{"id":"skip123456789","timestamp":"2026-05-13T10:00:00Z","cwd":` + quote(project) + `}}`,
@@ -297,7 +297,7 @@ func TestSummarizeTodayOnlyUsesLast24Hours(t *testing.T) {
 	if err := os.Chmod(script, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[summarizer]\ncommand = ["+quote(script)+"]\n")
+	writeFile(t, filepath.Join(home, ".config", "holocron", "config.toml"), "[pi]\nexecutable = "+quote(script)+"\n")
 	writeFile(t, filepath.Join(srcRoot, "today.jsonl"), strings.Join([]string{
 		`{"type":"session_meta","payload":{"id":"today123456789","timestamp":"2026-05-27T10:00:00Z","cwd":` + quote(project) + `}}`,
 		`{"role":"user","content":"Summarize today"}`,
@@ -416,6 +416,86 @@ func TestOpenValidatesCWDAndExecsArgv(t *testing.T) {
 	if strings.Join(gotArgv, " ") != "codex resume abcdef1234567890" {
 		t.Fatalf("argv = %#v", gotArgv)
 	}
+}
+
+func TestAskCommandUsesConfiguredPiAndIndexedTranscript(t *testing.T) {
+	home, argsLog, promptLog := setupAskFixture(t)
+	var out, errOut bytes.Buffer
+	app := App{Home: home, Stdout: &out, Stderr: &errOut, Spinner: false}
+	code := app.Run([]string{"ask", "cx:ask12345", "What", "changed?"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, errOut.String())
+	}
+	if out.String() != "fake answer" {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(args)); got != "-p\n--no-tools\n--no-session" {
+		t.Fatalf("argv = %q", got)
+	}
+	prompt, err := os.ReadFile(promptLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"holocron_id: cx:ask12345", "tool: codex", "Fix auth redirect handling", "Updated the login callback", "What changed?"} {
+		if !strings.Contains(string(prompt), want) {
+			t.Fatalf("prompt missing %q:\n%s", want, string(prompt))
+		}
+	}
+	if strings.Contains(string(prompt), `"type":"session_meta"`) {
+		t.Fatalf("prompt contains raw JSONL instead of normalized transcript:\n%s", string(prompt))
+	}
+}
+
+func TestAskCommandReadsQuestionFromStdin(t *testing.T) {
+	home, _, promptLog := setupAskFixture(t)
+	var out, errOut bytes.Buffer
+	app := App{Home: home, Stdout: &out, Stderr: &errOut, Spinner: false, Stdin: strings.NewReader("stdin question"), IsTerminal: func() bool { return false }}
+	code := app.Run([]string{"ask", "cx:ask12345"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stderr=%s", code, errOut.String())
+	}
+	prompt, err := os.ReadFile(promptLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prompt), "stdin question") {
+		t.Fatalf("prompt missing stdin question:\n%s", string(prompt))
+	}
+}
+
+func setupAskFixture(t *testing.T) (home, argsLog, promptLog string) {
+	t.Helper()
+	home = t.TempDir()
+	project := filepath.Join(home, "project")
+	srcRoot := filepath.Join(home, ".codex", "sessions")
+	cfgDir := filepath.Join(home, ".config", "holocron")
+	for _, dir := range []string{project, srcRoot, cfgDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	argsLog = filepath.Join(home, "args.log")
+	promptLog = filepath.Join(home, "prompt.log")
+	fakePi := filepath.Join(home, "pi")
+	writeFile(t, fakePi, "#!/bin/sh\nprintf '%s\\n' \"$@\" > "+quote(argsLog)+"\ncat > "+quote(promptLog)+"\nprintf 'fake answer'\n")
+	if err := os.Chmod(fakePi, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(cfgDir, "config.toml"), "[pi]\nexecutable = "+quote(fakePi)+"\n")
+	writeFile(t, filepath.Join(srcRoot, "codex.jsonl"), strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"ask123456789","timestamp":"2026-05-13T10:00:00Z","cwd":` + quote(project) + `}}`,
+		`{"role":"user","content":"Fix auth redirect handling"}`,
+		`{"role":"assistant","content":"Updated the login callback"}`,
+	}, "\n")+"\n")
+	app := App{Home: home, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Spinner: false}
+	if err := app.fullScan(); err != nil {
+		t.Fatal(err)
+	}
+	return home, argsLog, promptLog
 }
 
 func TestDaemonRunningFastUsesLockPIDWithoutLaunchctl(t *testing.T) {

@@ -171,6 +171,7 @@ holocron search "query terms"
 holocron search "query terms" --json
 holocron pick [query terms]
 holocron open <id>
+holocron ask <id> [question]
 holocron service install
 holocron service uninstall
 holocron service start
@@ -243,6 +244,15 @@ If the service is not running, pick should fail clearly and tell the user to ins
 - uses argv execution to `exec` the appropriate resume command
 
 If the source session file is missing at open time, fail clearly and remove the stale session from the index.
+
+### `ask`
+
+`holocron ask <id> [question]`:
+
+- loads the indexed session transcript as context
+- reads the question from arguments, piped stdin, or an interactive prompt
+- runs Pi prompt mode without tools or session mutation
+- prints only the model answer to stdout
 
 ### `service`
 

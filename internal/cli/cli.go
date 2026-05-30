@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	askprompt "github.com/mattwynne/holocron/internal/ask"
 	"github.com/mattwynne/holocron/internal/index"
+	"github.com/mattwynne/holocron/internal/llm"
 	"github.com/mattwynne/holocron/internal/piexport"
 	"github.com/mattwynne/holocron/internal/session"
 	"github.com/mattwynne/holocron/internal/summarizer"
@@ -29,12 +31,14 @@ import (
 const serviceLabel = "net.mattwynne.holocron"
 
 type App struct {
-	Stdout  io.Writer
-	Stderr  io.Writer
-	Home    string
-	Exec    func(string, []string, []string) error
-	Now     func() time.Time
-	Spinner bool
+	Stdout     io.Writer
+	Stderr     io.Writer
+	Home       string
+	Exec       func(string, []string, []string) error
+	Now        func() time.Time
+	Spinner    bool
+	Stdin      io.Reader
+	IsTerminal func() bool
 }
 
 func New() App {
@@ -46,6 +50,11 @@ func New() App {
 		Exec:    syscall.Exec,
 		Now:     time.Now,
 		Spinner: true,
+		Stdin:   os.Stdin,
+		IsTerminal: func() bool {
+			info, err := os.Stdin.Stat()
+			return err == nil && (info.Mode()&os.ModeCharDevice) != 0
+		},
 	}
 }
 
@@ -70,6 +79,8 @@ func (a App) Run(args []string) int {
 		err = a.pick(args[1:])
 	case "open":
 		err = a.open(args[1:])
+	case "ask":
+		err = a.ask(args[1:])
 	case "view":
 		err = a.view(args[1:])
 	case "continue":
@@ -105,6 +116,7 @@ Usage:
   holocron today [--json]           List sessions updated in the last 24 hours
   holocron pick [Q]                 Pick and reopen a session in the TUI
   holocron open ID                  Reopen an indexed session in its native tool
+  holocron ask ID [QUESTION]        Ask one question about an indexed session
   holocron view ID [--model MODEL]  View an indexed session in Pi
   holocron continue ID [--model MODEL] Continue an indexed session in Pi
   holocron export-pi ID             Export an indexed session to Pi JSONL
@@ -188,6 +200,95 @@ func (a App) open(args []string) error {
 		return errors.New("open requires exactly one session id")
 	}
 	return a.execResult(args[0])
+}
+
+func (a App) ask(args []string) error {
+	if len(args) < 1 || args[0] == "" {
+		return errors.New("ask requires a session id")
+	}
+	id := args[0]
+	row, err := a.store().Lookup(id)
+	if err != nil {
+		return err
+	}
+	question, err := a.readAskQuestion(row, args[1:])
+	if err != nil {
+		return err
+	}
+	question = strings.TrimSpace(question)
+	if question == "" {
+		return errors.New("ask requires a non-empty question")
+	}
+	ctx, err := a.askContext(id, row)
+	if err != nil {
+		return err
+	}
+	cfg, err := llm.LoadConfig(a.Home)
+	if err != nil {
+		return err
+	}
+	prompt := askprompt.BuildPromptFromContext(ctx, question, cfg.MaxInputTokens)
+	answer, err := llm.Runner{Config: cfg}.RunPrompt(context.Background(), prompt)
+	if err != nil {
+		return err
+	}
+	fmt.Fprint(a.Stdout, answer)
+	return nil
+}
+
+func (a App) readAskQuestion(row index.SearchResult, parts []string) (string, error) {
+	if len(parts) > 0 {
+		return strings.Join(parts, " "), nil
+	}
+	stdin := a.Stdin
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	isTerminal := false
+	if a.IsTerminal != nil {
+		isTerminal = a.IsTerminal()
+	} else if f, ok := stdin.(*os.File); ok {
+		info, err := f.Stat()
+		isTerminal = err == nil && (info.Mode()&os.ModeCharDevice) != 0
+	}
+	if !isTerminal {
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	return tui.PromptAskQuestion(a.Stdout, a.Stderr, row.ID, displayTitle(row))
+}
+
+func (a App) askContext(id string, row index.SearchResult) (askprompt.Context, error) {
+	tr, err := a.store().Transcript(id)
+	if err == nil {
+		return askprompt.ContextFromTranscript(tr, displayTitle(row)), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return askprompt.Context{}, err
+	}
+	rec, err := a.store().Get(id)
+	if err != nil {
+		return askprompt.Context{}, err
+	}
+	parsed, err := session.ParseFile(rec.Tool, filepath.Dir(rec.SourcePath), rec.SourcePath, session.ParseOptions{})
+	if err != nil {
+		return askprompt.Context{}, err
+	}
+	parsed.ID = rec.ID
+	if parsed.Title == "" {
+		parsed.Title = displayTitle(row)
+	}
+	return askprompt.ContextFromRecord(parsed), nil
+}
+
+func displayTitle(row index.SearchResult) string {
+	if row.GeneratedTitle != "" {
+		return row.GeneratedTitle
+	}
+	return row.Title
 }
 
 func (a App) view(args []string) error {
@@ -568,7 +669,7 @@ func (a App) summarizeOne(ctx context.Context, cfg summarizer.Config, opts summa
 		return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
 	}
 	if !opts.DryRun {
-		if err := a.store().UpdateGenerated(r.ID, final.Title, final.Summary, strings.Join(cfg.Command, " "), a.now()); err != nil {
+		if err := a.store().UpdateGenerated(r.ID, final.Title, final.Summary, strings.Join(cfg.LLM.PromptCommand(), " "), a.now()); err != nil {
 			return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
 		}
 	}

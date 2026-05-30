@@ -7,22 +7,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/mattwynne/holocron/internal/llm"
 	"github.com/mattwynne/holocron/internal/session"
 )
 
 type Config struct {
-	Command            []string
-	MaxInputTokens     int
+	LLM                llm.Config
 	ChunkTokens        int
 	MaxChunks          int
-	Timeout            time.Duration
 	Background         bool
 	BackgroundInterval time.Duration
 	BackgroundJobs     int
@@ -63,11 +61,9 @@ type Runner struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Command:            []string{"pi", "-p", "--no-tools", "--no-session"},
-		MaxInputTokens:     4000,
+		LLM:                llm.DefaultConfig(),
 		ChunkTokens:        6000,
 		MaxChunks:          20,
-		Timeout:            120 * time.Second,
 		Background:         true,
 		BackgroundInterval: 30 * time.Second,
 		BackgroundJobs:     1,
@@ -85,6 +81,11 @@ func DefaultConfig() Config {
 
 func LoadConfig(home string) (Config, error) {
 	cfg := DefaultConfig()
+	llmCfg, err := llm.LoadConfig(home)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.LLM = llmCfg
 	path := filepath.Join(home, ".config", "holocron", "config.toml")
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -110,22 +111,10 @@ func LoadConfig(home string) (Config, error) {
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 		switch section + "." + key {
-		case "summarizer.command":
-			cmd, err := parseStringArray(val)
-			if err != nil {
-				return cfg, fmt.Errorf("parse summarizer.command: %w", err)
-			}
-			if len(cmd) > 0 {
-				cfg.Command = cmd
-			}
-		case "summarizer.max_input_tokens":
-			cfg.MaxInputTokens = parseInt(val, cfg.MaxInputTokens)
 		case "summarizer.chunk_tokens":
 			cfg.ChunkTokens = parseInt(val, cfg.ChunkTokens)
 		case "summarizer.max_chunks":
 			cfg.MaxChunks = parseInt(val, cfg.MaxChunks)
-		case "summarizer.timeout_seconds":
-			cfg.Timeout = time.Duration(parseInt(val, int(cfg.Timeout/time.Second))) * time.Second
 		case "summarizer.background":
 			cfg.Background = parseBool(val, cfg.Background)
 		case "summarizer.background_interval_seconds":
@@ -151,13 +140,6 @@ func LoadConfig(home string) (Config, error) {
 	return cfg, nil
 }
 
-func parseStringArray(v string) ([]string, error) {
-	var out []string
-	if err := json.Unmarshal([]byte(v), &out); err == nil {
-		return out, nil
-	}
-	return nil, fmt.Errorf("expected TOML string array")
-}
 func parseInt(v string, d int) int {
 	n, err := strconv.Atoi(strings.Trim(v, `"`))
 	if err != nil {
@@ -175,10 +157,6 @@ func parseBool(v string, d bool) bool {
 
 func (r Runner) Summarize(ctx context.Context, rec session.Record) (Final, error) {
 	cfg := r.Config
-	cfg.Command = EnsureEphemeralPiCommand(cfg.Command)
-	if len(cfg.Command) == 0 {
-		return Final{}, errors.New("summarizer command is empty")
-	}
 	skeleton := BuildSkeleton(rec, cfg)
 	excerpts := SelectedTranscriptExcerpt(rec.Transcript, cfg)
 	prompt := finalPrompt(rec, skeleton, excerpts)
@@ -202,7 +180,7 @@ func BuildSkeleton(rec session.Record, cfg Config) string {
 
 func SelectedTranscriptExcerpt(text string, cfg Config) string {
 	text = redactSecrets(text)
-	maxChars := cfg.MaxInputTokens * 4 / 2
+	maxChars := cfg.LLM.MaxInputTokens * 4 / 2
 	if maxChars <= 0 {
 		maxChars = 24000
 	}
@@ -215,9 +193,9 @@ func SelectedTranscriptExcerpt(text string, cfg Config) string {
 }
 
 func (r Runner) callJSON(ctx context.Context, prompt string, dst any) error {
-	ctx, cancel := context.WithTimeout(ctx, r.Config.Timeout)
-	defer cancel()
-	out, stderr, err := runCommand(ctx, r.Config.Command, prompt)
+	runner := llm.Runner{Config: r.Config.LLM}
+	result, err := runner.RunPromptResult(ctx, prompt)
+	out := result.Stdout
 	if err == nil {
 		err = json.Unmarshal([]byte(strictJSON(out)), dst)
 	}
@@ -225,48 +203,18 @@ func (r Runner) callJSON(ctx context.Context, prompt string, dst any) error {
 		return nil
 	}
 	repair := "Repair this response into strict JSON matching the requested schema. Return only JSON.\n\n" + out
-	out2, stderr2, err2 := runCommand(ctx, r.Config.Command, repair)
+	result2, err2 := runner.RunPromptResult(ctx, repair)
 	if r.Stderr != nil {
-		r.Stderr.WriteString(stderr)
-		r.Stderr.WriteString(stderr2)
+		r.Stderr.WriteString(result.Stderr)
+		r.Stderr.WriteString(result2.Stderr)
 	}
 	if err2 != nil {
 		return err2
 	}
-	if err := json.Unmarshal([]byte(strictJSON(out2)), dst); err != nil {
+	if err := json.Unmarshal([]byte(strictJSON(result2.Stdout)), dst); err != nil {
 		return fmt.Errorf("parse model JSON: %w; original error: %v", err, err)
 	}
 	return nil
-}
-
-func EnsureEphemeralPiCommand(argv []string) []string {
-	if len(argv) == 0 {
-		return argv
-	}
-	base := filepath.Base(argv[0])
-	if base != "pi" {
-		return argv
-	}
-	for _, arg := range argv[1:] {
-		if arg == "--no-session" || arg == "--session" || strings.HasPrefix(arg, "--session=") {
-			return argv
-		}
-	}
-	out := append([]string(nil), argv...)
-	return append(out, "--no-session")
-}
-
-func runCommand(ctx context.Context, argv []string, prompt string) (string, string, error) {
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Stdin = strings.NewReader(prompt)
-	var out, serr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &serr
-	err := cmd.Run()
-	if ctx.Err() != nil {
-		err = ctx.Err()
-	}
-	return out.String(), serr.String(), err
 }
 
 func chunkPrompt(rec session.Record, idx, total int, chunk string) string {

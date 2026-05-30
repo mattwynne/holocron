@@ -68,6 +68,13 @@ Open a result by ID in its native tool:
 holocron open pi:019e31be
 ```
 
+Ask one question about an indexed session without modifying it:
+
+```sh
+holocron ask pi:019e31be "What did we decide?"
+echo "What files changed?" | holocron ask cx:abcdef12
+```
+
 View or continue a normalized Claude session in Pi:
 
 ```sh
@@ -85,15 +92,19 @@ holocron summarize --missing --limit 20
 holocron summarize --recent --limit 20 --jobs 4 --dry-run --json
 ```
 
-Summaries are stored only in Holocron's SQLite index. Holocron never writes generated metadata back to provider session files. Configure the model command in `~/.config/holocron/config.toml`; it receives a prompt on stdin and must return strict JSON on stdout:
+Summaries are stored only in Holocron's SQLite index. Holocron never writes generated metadata back to provider session files. Configure the shared Pi/LLM runner in `~/.config/holocron/config.toml`; Pi receives a prompt on stdin and summaries must return strict JSON on stdout:
 
 ```toml
+[pi]
+executable = "/absolute/path/to/pi"
+
+[llm]
+timeout_seconds = 300
+max_input_tokens = 200000
+
 [summarizer]
-command = ["pi", "-p", "--no-tools"]
-max_input_tokens = 4000
 chunk_tokens = 6000
 max_chunks = 20
-timeout_seconds = 120
 
 # Queue-style background summarization in the daemon. Indexing stays fast;
 # missing titles populate gradually for UIs that poll search/today results.

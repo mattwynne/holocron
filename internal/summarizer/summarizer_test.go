@@ -17,8 +17,10 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte(`[summarizer]
-command = ["/bin/echo", "ok"]
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte(`[pi]
+executable = "/bin/echo"
+
+[llm]
 max_input_tokens = 99
 timeout_seconds = 3
 
@@ -32,7 +34,7 @@ max_tool_output_chars = 50
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(cfg.Command, " ") != "/bin/echo ok" || cfg.MaxInputTokens != 99 || cfg.Timeout != 3*time.Second || cfg.Selection.IncludeFirstTurns != 1 || cfg.Selection.MaxToolOutputChars != 50 {
+	if cfg.LLM.PiExecutable != "/bin/echo" || cfg.LLM.MaxInputTokens != 99 || cfg.LLM.Timeout != 3*time.Second || cfg.Selection.IncludeFirstTurns != 1 || cfg.Selection.MaxToolOutputChars != 50 {
 		t.Fatalf("unexpected config: %#v", cfg)
 	}
 }
@@ -44,7 +46,7 @@ func TestRunnerSummarizeParsesStrictJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := Runner{Config: DefaultConfig()}
-	r.Config.Command = []string{script}
+	r.Config.LLM.PiExecutable = script
 	rec := session.Record{Tool: session.ToolPi, SessionID: "abc", CWD: "/tmp/project", SourcePath: "/tmp/session.jsonl", FirstPrompt: "summarize sessions", Title: "summarize sessions", UpdatedAt: time.Now(), Transcript: "user: summarize sessions\nassistant: done"}
 	got, err := r.Summarize(context.Background(), rec)
 	if err != nil {
@@ -63,8 +65,8 @@ func TestRunnerSummarizeUsesSingleModelCallForLargeSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := Runner{Config: DefaultConfig()}
-	r.Config.Command = []string{script}
-	r.Config.MaxInputTokens = 10
+	r.Config.LLM.PiExecutable = script
+	r.Config.LLM.MaxInputTokens = 10
 	rec := session.Record{Tool: session.ToolPi, SessionID: "abc", CWD: "/tmp/project", SourcePath: "/tmp/session.jsonl", FirstPrompt: "summarize", Title: "summarize", UpdatedAt: time.Now(), Transcript: strings.Repeat("user: lots of transcript\nassistant: lots of output\n", 200)}
 	if _, err := r.Summarize(context.Background(), rec); err != nil {
 		t.Fatal(err)
