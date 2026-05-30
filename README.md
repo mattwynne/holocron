@@ -75,6 +75,8 @@ holocron ask pi:019e31be "What did we decide?"
 echo "What files changed?" | holocron ask cx:abcdef12
 ```
 
+Press Ctrl-C to stop an in-flight `ask` request.
+
 View or continue a normalized Claude session in Pi:
 
 ```sh

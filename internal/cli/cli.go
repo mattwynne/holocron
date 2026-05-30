@@ -24,6 +24,7 @@ import (
 	"github.com/mattwynne/holocron/internal/llm"
 	"github.com/mattwynne/holocron/internal/piexport"
 	"github.com/mattwynne/holocron/internal/session"
+	"github.com/mattwynne/holocron/internal/sessionprompt"
 	"github.com/mattwynne/holocron/internal/summarizer"
 	"github.com/mattwynne/holocron/internal/tui"
 )
@@ -36,6 +37,7 @@ type App struct {
 	Home       string
 	Exec       func(string, []string, []string) error
 	Now        func() time.Time
+	Context    func() context.Context
 	Spinner    bool
 	Stdin      io.Reader
 	IsTerminal func() bool
@@ -219,7 +221,7 @@ func (a App) ask(args []string) error {
 	if question == "" {
 		return errors.New("ask requires a non-empty question")
 	}
-	ctx, err := a.askContext(id, row)
+	promptCtx, err := sessionprompt.LoadContext(a.store(), id, displayTitle(row))
 	if err != nil {
 		return err
 	}
@@ -227,8 +229,12 @@ func (a App) ask(args []string) error {
 	if err != nil {
 		return err
 	}
-	prompt := askprompt.BuildPromptFromContext(ctx, question, cfg.MaxInputTokens)
-	answer, err := llm.Runner{Config: cfg}.RunPrompt(context.Background(), prompt)
+	prompt := askprompt.BuildPrompt(promptCtx, question, cfg.MaxInputTokens)
+	cmdCtx, cancel := a.commandContext()
+	defer cancel()
+	stop := a.startSpinner("Thinking")
+	answer, err := llm.Runner{Config: cfg}.RunPrompt(cmdCtx, prompt)
+	stop()
 	if err != nil {
 		return err
 	}
@@ -259,29 +265,6 @@ func (a App) readAskQuestion(row index.SearchResult, parts []string) (string, er
 		return string(b), nil
 	}
 	return tui.PromptAskQuestion(a.Stdout, a.Stderr, row.ID, displayTitle(row))
-}
-
-func (a App) askContext(id string, row index.SearchResult) (askprompt.Context, error) {
-	tr, err := a.store().Transcript(id)
-	if err == nil {
-		return askprompt.ContextFromTranscript(tr, displayTitle(row)), nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return askprompt.Context{}, err
-	}
-	rec, err := a.store().Get(id)
-	if err != nil {
-		return askprompt.Context{}, err
-	}
-	parsed, err := session.ParseFile(rec.Tool, filepath.Dir(rec.SourcePath), rec.SourcePath, session.ParseOptions{})
-	if err != nil {
-		return askprompt.Context{}, err
-	}
-	parsed.ID = rec.ID
-	if parsed.Title == "" {
-		parsed.Title = displayTitle(row)
-	}
-	return askprompt.ContextFromRecord(parsed), nil
 }
 
 func displayTitle(row index.SearchResult) string {
@@ -654,17 +637,12 @@ func (a App) backgroundSummaryWorker(ctx context.Context, writeMu *sync.Mutex) {
 
 func (a App) summarizeOne(ctx context.Context, cfg summarizer.Config, opts summarizeOptions, job summarizeJob) summarizeResult {
 	r := job.Row
-	rec, err := a.store().Get(r.ID)
+	promptCtx, err := sessionprompt.LoadContext(a.store(), r.ID, displayTitle(r))
 	if err != nil {
 		return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
 	}
-	rec, err = session.ParseFile(rec.Tool, filepath.Dir(rec.SourcePath), rec.SourcePath, session.ParseOptions{})
-	if err != nil {
-		return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
-	}
-	rec.ID = r.ID
 	runner := summarizer.Runner{Config: cfg}
-	final, err := runner.Summarize(ctx, rec)
+	final, err := runner.SummarizeContext(ctx, promptCtx)
 	if err != nil {
 		return summarizeResult{Index: job.Index, Err: fmt.Errorf("summarize %s: %w", r.ID, err)}
 	}
@@ -873,6 +851,13 @@ func (a App) now() time.Time {
 		return a.Now()
 	}
 	return time.Now()
+}
+
+func (a App) commandContext() (context.Context, func()) {
+	if a.Context != nil {
+		return a.Context(), func() {}
+	}
+	return signal.NotifyContext(context.Background(), os.Interrupt)
 }
 
 func (a App) startSpinner(label string) func() {

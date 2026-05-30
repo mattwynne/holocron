@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mattwynne/holocron/internal/session"
+	"github.com/mattwynne/holocron/internal/sessionprompt"
 )
 
 func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
@@ -57,6 +58,33 @@ func TestRunnerSummarizeParsesStrictJSON(t *testing.T) {
 	}
 }
 
+func TestSummarizeContextUsesSharedTranscriptText(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "model")
+	promptPath := filepath.Join(dir, "prompt")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat > "+shellQuote(promptPath)+"\necho '{\"title\":\"Shared context\",\"summary\":\"Used shared context.\",\"status\":\"implemented\",\"key_files\":[],\"confidence\":\"high\"}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := Runner{Config: DefaultConfig()}
+	r.Config.LLM.PiExecutable = script
+	ctx := sessionprompt.Context{HolocronID: "cx:abc12345", Tool: session.ToolCodex, TranscriptText: "shared transcript text"}
+	got, err := r.SummarizeContext(context.Background(), ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "Shared context" {
+		t.Fatalf("got %#v", got)
+	}
+	b, err := os.ReadFile(promptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "shared transcript text") {
+		t.Fatalf("prompt = %s", string(b))
+	}
+}
+
 func TestRunnerSummarizeUsesSingleModelCallForLargeSessions(t *testing.T) {
 	dir := t.TempDir()
 	calls := filepath.Join(dir, "calls")
@@ -79,6 +107,8 @@ func TestRunnerSummarizeUsesSingleModelCallForLargeSessions(t *testing.T) {
 		t.Fatalf("model calls = %d, want 1", len(b))
 	}
 }
+
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
 
 func TestBuildSkeletonRedactsCommonSecrets(t *testing.T) {
 	rec := session.Record{Transcript: "token=supersecret\npassword: hunter2"}

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -464,6 +465,21 @@ func TestAskCommandReadsQuestionFromStdin(t *testing.T) {
 	}
 	if !strings.Contains(string(prompt), "stdin question") {
 		t.Fatalf("prompt missing stdin question:\n%s", string(prompt))
+	}
+}
+
+func TestAskCancelsPiWhenContextCancelled(t *testing.T) {
+	home, _, _ := setupAskFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out, errOut bytes.Buffer
+	app := App{Home: home, Stdout: &out, Stderr: &errOut, Spinner: false, Context: func() context.Context { return ctx }}
+	code := app.Run([]string{"ask", "cx:ask12345", "question"})
+	if code == 0 {
+		t.Fatal("expected cancellation failure")
+	}
+	if !strings.Contains(errOut.String(), "context canceled") && !strings.Contains(errOut.String(), "canceled") {
+		t.Fatalf("stderr = %s", errOut.String())
 	}
 }
 

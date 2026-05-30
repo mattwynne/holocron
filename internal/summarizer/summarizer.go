@@ -15,6 +15,7 @@ import (
 
 	"github.com/mattwynne/holocron/internal/llm"
 	"github.com/mattwynne/holocron/internal/session"
+	"github.com/mattwynne/holocron/internal/sessionprompt"
 )
 
 type Config struct {
@@ -156,10 +157,14 @@ func parseBool(v string, d bool) bool {
 }
 
 func (r Runner) Summarize(ctx context.Context, rec session.Record) (Final, error) {
+	return r.SummarizeContext(ctx, sessionprompt.ContextFromRecord(rec))
+}
+
+func (r Runner) SummarizeContext(ctx context.Context, sp sessionprompt.Context) (Final, error) {
 	cfg := r.Config
-	skeleton := BuildSkeleton(rec, cfg)
-	excerpts := SelectedTranscriptExcerpt(rec.Transcript, cfg)
-	prompt := finalPrompt(rec, skeleton, excerpts)
+	skeleton := BuildContextSkeleton(sp, cfg)
+	excerpts := SelectedTranscriptExcerpt(sp.TranscriptText, cfg)
+	prompt := finalPrompt(skeleton, excerpts)
 	var out Final
 	if err := r.callJSON(ctx, prompt, &out); err != nil {
 		return Final{}, err
@@ -173,8 +178,12 @@ func (r Runner) Summarize(ctx context.Context, rec session.Record) (Final, error
 }
 
 func BuildSkeleton(rec session.Record, cfg Config) string {
+	return BuildContextSkeleton(sessionprompt.ContextFromRecord(rec), cfg)
+}
+
+func BuildContextSkeleton(sp sessionprompt.Context, cfg Config) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "tool: %s\nsession_id: %s\ncwd: %s\nsource_path: %s\nprovider_title: %s\nfirst_user_prompt: %s\nmessages: %d\nupdated_at: %s\n", rec.Tool, rec.SessionID, rec.CWD, rec.SourcePath, rec.Title, rec.FirstPrompt, rec.MessageCount, rec.UpdatedAt.Format(time.RFC3339))
+	fmt.Fprintf(&b, "tool: %s\nsession_id: %s\ncwd: %s\nprovider_title: %s\nupdated_at: %s\n", sp.Tool, sp.ProviderSessionID, sp.CWD, sp.Title, sp.UpdatedAt.Format(time.RFC3339))
 	return b.String()
 }
 
@@ -225,7 +234,7 @@ Chunk:
 %s`, idx, total, rec.Tool, rec.SessionID, rec.CWD, chunk)
 }
 
-func finalPrompt(rec session.Record, skeleton, excerpts string) string {
+func finalPrompt(skeleton, excerpts string) string {
 	return fmt.Sprintf(`Name and summarize this coding-agent session. Return strict JSON only with schema:
 {"title":"Add recent sessions command","summary":"One or two sentence factual summary.","status":"implemented|partial|unknown","key_files":["path"],"confidence":"high|medium|low"}
 Title rules: eight words or fewer, no trailing period, concrete and searchable, prefer task/outcome, avoid "Session about". Do not invent files or outcomes.
