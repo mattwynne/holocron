@@ -10,9 +10,13 @@ Holocron is local-first: it reads session files from disk and stores its index i
 ~/.local/share/holocron/index.sqlite
 ```
 
+## Platform support
+
+Holocron currently supports macOS only. The background indexer uses `launchd`, and support for Linux or Windows has not been added yet.
+
 ## Install
 
-Requires Go and macOS. The background indexer currently uses `launchd`.
+Requires Go and macOS.
 
 ```sh
 git clone https://github.com/mattwynne/holocron.git
