@@ -652,3 +652,171 @@ func resultIDSet(results []SearchResult) map[string]bool {
 	}
 	return ids
 }
+
+func TestConcurrentReadDuringLongWriteTransaction(t *testing.T) {
+	// This test simulates the real-world scenario where `holocron daemon`
+	// is performing a full Rebuild (which can take minutes with a 1.6GB index),
+	// and a user runs `holocron open` which should wait rather than fail with SQLITE_BUSY.
+
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+	src := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(src, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial record
+	rec := session.Record{
+		Tool:          session.ToolPi,
+		SourcePath:    src,
+		SessionID:     "initial123",
+		Title:         "Initial Session",
+		FirstPrompt:   "Initial prompt",
+		CWD:           "/tmp/test",
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		FileSizeBytes: 1024,
+		MessageCount:  5,
+		ResumeArgv:    []string{"pi", "resume", "initial123"},
+		ResumeCommand: "cd /tmp/test && pi resume initial123",
+		Transcript:    "initial session content",
+	}
+
+	if err := store.Rebuild([]session.Record{rec}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get the assigned ID
+	results, err := store.Recent(1)
+	if err != nil || len(results) == 0 {
+		t.Fatalf("failed to get assigned ID: %v", err)
+	}
+	assignedID := results[0].ID
+
+	// Open a direct connection to simulate a long-running write transaction
+	db, err := sql.Open("sqlite", store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Start a long-running write transaction
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold a write lock by executing a write operation
+	_, err = tx.Exec("UPDATE sessions SET title = ? WHERE id = ?", "Modified Title", assignedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use channels to coordinate the test
+	readStarted := make(chan bool)
+	readCompleted := make(chan error)
+
+	// Attempt concurrent read operations while the write transaction is held
+	go func() {
+		readStarted <- true
+
+		// Try Store.Get (used by `holocron open`)
+		result, err := store.Get(assignedID)
+		if err != nil {
+			readCompleted <- err
+			return
+		}
+
+		// Verify we got the original data (not the modified title from the uncommitted transaction)
+		if result.ID != assignedID {
+			readCompleted <- nil
+			return
+		}
+
+		// Try Store.Search (uses openReadOnly)
+		_, err = store.Search("initial", 10)
+		readCompleted <- err
+	}()
+
+	// Wait for the read goroutine to start
+	<-readStarted
+
+	// Sleep briefly to ensure the read goroutine is waiting on the lock
+	time.Sleep(100 * time.Millisecond)
+
+	// Commit the write transaction to release the lock
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for read operations to complete
+	err = <-readCompleted
+
+	if err != nil {
+		// If we get SQLITE_BUSY, the busy_timeout was not properly configured
+		if strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked") {
+			t.Fatalf("Read operation failed with database locked error (busy_timeout not working): %v", err)
+		}
+		t.Fatalf("Read operation failed: %v", err)
+	}
+}
+
+func TestBusyTimeoutSetBeforeFirstDatabaseAccess(t *testing.T) {
+	// This test verifies that busy_timeout is set before any database operations
+	// that might encounter locks, preventing immediate SQLITE_BUSY failures.
+
+	store := Store{Path: filepath.Join(t.TempDir(), "index.sqlite")}
+
+	// Initialize the database
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open a write transaction on a separate connection
+	db, err := sql.Open("sqlite", store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute a write to hold the lock
+	_, err = tx.Exec("INSERT INTO sessions(id, tool, source_path, session_id, title, first_prompt, cwd, created_at, updated_at, file_size_bytes, message_count, resume_argv, resume_command) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"test:id", "pi", "/tmp/test.jsonl", "session123", "Test", "Test prompt", "/tmp", time.Now().Format(time.RFC3339), time.Now().Format(time.RFC3339), 100, 1, "[]", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to call openInitialized while the write transaction is held
+	// This should wait (not fail immediately) because busy_timeout is set first
+	done := make(chan error)
+	go func() {
+		db2, err := store.openInitialized()
+		if err != nil {
+			done <- err
+			return
+		}
+		db2.Close()
+		done <- nil
+	}()
+
+	// Wait briefly
+	time.Sleep(100 * time.Millisecond)
+
+	// Commit to release the lock
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The openInitialized call should complete successfully
+	err = <-done
+	if err != nil {
+		if strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked") {
+			t.Fatalf("openInitialized failed with database locked error (busy_timeout not set early enough): %v", err)
+		}
+		t.Fatalf("openInitialized failed: %v", err)
+	}
+}

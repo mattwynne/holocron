@@ -378,7 +378,7 @@ func (s Store) openReadOnly() (*sql.DB, error) {
 	if _, err := os.Stat(s.Path); err != nil {
 		return nil, err
 	}
-	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(500)", filepath.ToSlash(s.Path))
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(30000)", filepath.ToSlash(s.Path))
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -404,11 +404,11 @@ func (s Store) openInitialized() (*sql.DB, error) {
 }
 
 func initSchema(db *sql.DB) error {
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		return fmt.Errorf("enable WAL: %w", err)
-	}
 	if _, err := db.Exec("PRAGMA busy_timeout=30000"); err != nil {
 		return fmt.Errorf("set busy timeout: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return fmt.Errorf("enable WAL: %w", err)
 	}
 	var version int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
