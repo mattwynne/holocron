@@ -38,6 +38,12 @@ This installs and starts a per-user launch agent. If `~/.pi` exists, Holocron al
 
 That extension registers project-local Pi sessions that are not stored under the normal `~/.pi/agent/sessions` tree.
 
+The Pi skill for finding prior sessions lives at `.pi/skills/holocron/`. To make it available from every project, link it globally:
+
+```sh
+ln -s ~/git/mattwynne/holocron/.pi/skills/holocron ~/.pi/agent/skills/holocron
+```
+
 ## Use
 
 Search sessions from the current folder tree:
